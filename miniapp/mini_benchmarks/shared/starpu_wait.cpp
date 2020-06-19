@@ -2,6 +2,7 @@
 #include <memory>
 #include <iostream>
 #include <cstdlib>
+#include <atomic>
 #include "common.hpp"
 #include <starpu.h>
 
@@ -11,8 +12,12 @@
  */
 
 double SPIN_TIME = 0.0;
+std::atomic<size_t> n_tasks_ran(0);
 
 void task(void *buffers[], void *cl_arg) { 
+#ifdef CHECK_NTASKS
+    n_tasks_ran++;
+#endif
     spin_for_seconds(SPIN_TIME);
 }
 
@@ -26,40 +31,27 @@ struct starpu_codelet task_cl = {
 int wait_only(const int n_tasks, const double spin_time, const int repeat, const int verb) {
 
     SPIN_TIME = spin_time;
-    
-    const char* env_n_cores = std::getenv("STARPU_NCPU");
-    if(env_n_cores == nullptr) { printf("Missing STARPU_NCPU\n"); exit(1); }
-    const int n_threads = atoi(env_n_cores);
+    const int n_threads = get_starpu_num_cores();
 
-    std::vector<double> efficiencies;
-    std::vector<double> times;
-    for(int step = 0; step < repeat; step++) {
+    wait_only_run_repeat("startpu_wait", n_threads, n_tasks, spin_time, repeat, verb, [&](){
 
+        n_tasks_ran.store(0);
         int err = starpu_init(NULL);
         if(err != 0) { printf("Error in starpu_init!\n"); exit(1); }
         const auto t0 = wtime_now();
         for (int k = 0; k < n_tasks; k++) {
-            starpu_task_insert(&task_cl, 0);
+            int err = starpu_task_insert(&task_cl, 0);
+            if(err != 0) { printf("Error in starpu_task_insert!\n"); exit(1); }
         }
         starpu_task_wait_for_all();
         const auto t1 = wtime_now();
+#ifdef CHECK_NTASKS
+        if(n_tasks_ran.load() != n_tasks) { printf("n_tasks_ran is wrong!\n"); exit(1); }
+#endif
         starpu_shutdown();
+        return wtime_elapsed(t0, t1);
 
-        const auto time = wtime_elapsed(t0, t1);
-        if(verb) printf("iteration repeat n_threads n_tasks spin_time time efficiency\n");
-        const double speedup = (double)(n_tasks) * (double)(spin_time) / (double)(time);
-        const double efficiency = speedup / (double)(n_threads);
-        times.push_back(time);
-        efficiencies.push_back(efficiency);
-        printf("++++ starpu %d %d %d %d %e %e %e\n", step, repeat, n_threads, n_tasks, spin_time, time, efficiency);
-
-    }
-
-    double eff_mean, eff_std, time_mean, time_std;
-    compute_stats(efficiencies, &eff_mean, &eff_std);
-    compute_stats(times, &time_mean, &time_std);
-    if(verb) printf("repeat n_threads spin_time n_tasks efficiency_mean efficiency_std time_mean time_std\n");
-    printf(">>>> starpu %d %d %e %d %e %e %e %e\n", repeat, n_threads, spin_time, n_tasks, eff_mean, eff_std, time_mean, time_std);
+    });
 
     return 0;
 }

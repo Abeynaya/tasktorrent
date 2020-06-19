@@ -9,8 +9,6 @@
 #include "tasktorrent/tasktorrent.hpp"
 #include "../common.hpp"
 
-typedef std::array<int,2> int2;
-
 /**
  * n_rows rows of tasks over n_cols columns
  * with n_edges deps between [i,j] and [i+k,j+1] for 0 <= k < n_edges
@@ -23,15 +21,12 @@ int wait_chain_deps(const int n_threads,
                     const int repeat, 
                     const int verb) {
 
-    std::vector<double> efficiencies;
-    std::vector<double> times;
-    int n_tasks = n_rows * n_cols;
-
-    for(int step = 0; step < repeat; step++) {
+    deps_run_repeat("ttor_deps", n_threads, n_rows, n_edges, n_cols, spin_time, repeat, verb, [&](){
 
         ttor::Threadpool_shared tp(n_threads, verb <= 1 ? 0 : verb, "Wk_");
         ttor::Taskflow<int2> tf(&tp, verb <= 1 ? 0 : verb);
         std::atomic<size_t> n_tasks_ran(0);
+        const int n_tasks = n_rows * n_cols;
 
         tf.set_mapping([&](int2 ij) {
             return (ij[0] % n_threads);
@@ -40,7 +35,9 @@ int wait_chain_deps(const int n_threads,
             return (ij[1] == 0 ? 1 : n_edges);
         })
         .set_task([&](int2 ij) {
+#ifdef CHECK_NTASKS
             n_tasks_ran++;
+#endif
             spin_for_seconds(spin_time);
             if(ij[1] < n_cols-1) {
                 for(int k = 0; k < n_edges; k++) {
@@ -59,23 +56,13 @@ int wait_chain_deps(const int n_threads,
         }
         tp.join();
         auto t1 = ttor::wctime();
-        double time = ttor::elapsed(t0, t1);
-        if(verb) printf("iteration repeat n_threads n_rows n_edges n_cols spin_time time n_tasks efficiency\n");
-        assert(n_tasks_ran.load() == n_tasks);
-        double speedup = (double)(n_tasks) * (double)(spin_time) / (double)(time);
-        double efficiency = speedup / (double)(n_threads);
-        efficiencies.push_back(efficiency);
-        times.push_back(time);
-        printf("++++ ttordeps %d %d %d %d %d %d %e %e %d %e\n", step, repeat, n_threads, n_rows, n_edges, n_cols, spin_time, time, n_tasks, efficiency);
+#ifdef CHECK_NTASKS
+        if(n_tasks_ran.load() != n_tasks) { printf("n_tasks_ran is wrong!\n"); exit(1); }
+#endif
+        return ttor::elapsed(t0, t1);
 
-    }
-
-    double eff_mean, eff_std, time_mean, time_std;
-    compute_stats(efficiencies, &eff_mean, &eff_std);
-    compute_stats(times, &time_mean, &time_std);
-    if(verb) printf("repeat n_threads n_rows n_edges n_cols spin_time n_tasks efficiency_mean efficiency_std time_mean time_std\n");
-    printf(">>>> ttordeps %d %d %d %d %d %e %d %e %e %e %e\n", repeat, n_threads, n_rows, n_edges, n_cols, spin_time, n_tasks, eff_mean, eff_std, time_mean, time_std);
-
+    });
+    
     return 0;
 }
 

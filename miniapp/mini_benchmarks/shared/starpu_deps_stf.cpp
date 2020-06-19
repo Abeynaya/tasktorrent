@@ -21,7 +21,9 @@ std::atomic<size_t> n_tasks_ran(0);
 std::vector<bool> done;
 
 void task(void *buffers[], void *cl_arg) { 
+#ifdef CHECK_NTASKS
     n_tasks_ran++;
+#endif
     spin_for_seconds(SPIN_TIME);
 }
 
@@ -69,16 +71,10 @@ int wait_chain_deps(const int n_rows,
                     const int repeat, 
                     const int verb) {
 
-    std::vector<double> efficiencies;
-    std::vector<double> times;
     int n_tasks = n_rows * n_cols;
-
-    const char* env_n_cores = std::getenv("STARPU_NCPU");
-    assert(env_n_cores != nullptr);
-    const int n_threads = atoi(env_n_cores);
-    
+    const int n_threads = get_starpu_num_cores();
     SPIN_TIME = spin_time;
-
+    
     std::map<int,struct starpu_codelet*> clts;
     clts[1] = &cl_1;
     clts[2] = &cl_2;
@@ -88,7 +84,7 @@ int wait_chain_deps(const int n_rows,
     clts[17] = &cl_17;
     clts[33] = &cl_33;
 
-    for(int step = 0; step < repeat; step++) {
+    deps_run_repeat("starpu_deps_stf", n_threads, n_rows, n_edges, n_cols, spin_time, repeat, verb, [&](){
 
         n_tasks_ran.store(0);
         int err = starpu_init(NULL);
@@ -126,21 +122,12 @@ int wait_chain_deps(const int n_rows,
             starpu_data_unregister(handles[k]);
         }
         starpu_shutdown();
-        double time = (end - start)/1e6;
-        if(verb) printf("iteration repeat n_threads n_rows n_edges n_cols spin_time time n_tasks efficiency\n");
-        assert(n_tasks_ran.load() == n_tasks);
-        double speedup = (double)(n_tasks) * (double)(spin_time) / (double)(time);
-        double efficiency = speedup / (double)(n_threads);
-        efficiencies.push_back(efficiency);
-        times.push_back(time);
-        printf("++++ starpudepsstf %d %d %d %d %d %d %e %e %d %e\n", step, repeat, n_threads, n_rows, n_edges, n_cols, spin_time, time, n_tasks, efficiency);
-    }
+#ifdef CHECK_NTASKS
+        if(n_tasks_ran.load() != n_tasks) { printf("n_tasks_ran is wrong!\n"); exit(1); }
+#endif
+        return (end - start)/1e6;
 
-    double eff_mean, eff_std, time_mean, time_std;
-    compute_stats(efficiencies, &eff_mean, &eff_std);
-    compute_stats(times, &time_mean, &time_std);
-    if(verb) printf("repeat n_threads n_rows n_edges n_cols spin_time n_tasks efficiency_mean efficiency_std time_mean time_std\n");
-    printf(">>>> starpudepsstf %d %d %d %d %d %e %d %e %e %e %e\n", repeat, n_threads, n_rows, n_edges, n_cols, spin_time, n_tasks, eff_mean, eff_std, time_mean, time_std);
+    });
 
     return 0;
 }

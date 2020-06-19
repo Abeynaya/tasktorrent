@@ -14,10 +14,7 @@
  */
 int wait_only(const int n_threads, const int n_tasks, const double spin_time, const bool time_insertion, const int repeat, const int verb) {
 
-    std::vector<double> efficiencies;
-    std::vector<double> times;
-
-    for(int i = 0; i < repeat; i++) {
+    wait_only_run_repeat("ttor_wait_time_insertion" + std::to_string(time_insertion), n_threads, n_tasks, spin_time, repeat, verb, [&](){
 
         ttor::Threadpool_shared tp(n_threads, 0, "Wk_", false);
         ttor::Taskflow<int> tf(&tp, 0);
@@ -52,19 +49,9 @@ int wait_only(const int n_threads, const int n_tasks, const double spin_time, co
             const auto t1 = wtime_now();
             time = wtime_elapsed(t0, t1);
         }
-        if(verb) printf("iteration repeat n_threads n_tasks spin_time time time_insertion efficiency\n");
-        double speedup = (double)(n_tasks) * (double)(spin_time) / (double)(time);
-        double efficiency = speedup / (double)(n_threads);
-        times.push_back(time);
-        efficiencies.push_back(efficiency);
-        printf("++++ ttor %d %d %d %d %e %e %d %e\n", i, repeat, n_threads, n_tasks, spin_time, time, (int) time_insertion, efficiency);
-    }
-
-    double eff_mean, eff_std, time_mean, time_std;
-    compute_stats(efficiencies, &eff_mean, &eff_std);
-    compute_stats(times, &time_mean, &time_std);
-    if(verb) printf("repeat n_threads spin_time n_tasks time_insertion efficiency_mean efficiency_std time_mean time_std\n");
-    printf(">>>> ttor %d %d %e %d %d %e %e %e %e\n", repeat, n_threads, spin_time, n_tasks, (int) time_insertion, eff_mean, eff_std, time_mean, time_std);
+        return time;
+        
+    });
 
     return 0;
 }
