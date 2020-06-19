@@ -1,7 +1,7 @@
 import subprocess
 import os
 
-repeat = 3
+repeat = 25
 for threads in [1, 2, 4, 8, 16]:
     for time in [1e-5, 1e-4]:
         tasks = round(threads * 1.0 / time)

@@ -1,6 +1,7 @@
 #!/bin/bash
-#SBATCH -o deps_comp_benchmarks.%j.out
+#SBATCH -o wait_benchmarks.%j.out
 #SBATCH -n 1
 #SBATCH -c 32
 
-python3 deps_comp_benchmarks.py
+ml intel/python/2019-3.6.8
+python3 wait_benchmarks.py

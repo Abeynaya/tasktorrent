@@ -1,7 +1,7 @@
 import subprocess
 import os
 
-repeat = 3
+repeat = 25
 n_rows = 32
 for threads in [1,2,4,8,16]:
     for n_edges in [1,2,4,8,16]:

@@ -1,6 +1,6 @@
 include Makefile.conf
 
-CFLAGS   += -pthread -O3 -std=c++14 -DTTOR_SHARED -Wall -Wextra -DCHECK_NTASKS
+CFLAGS   += -pthread -O3 -std=c++14 -DTTOR_SHARED -DNDEBUG -Wall -Wextra
 INCLUDE  += -I../../../ -I../
 LIBS     += 
 SRCDIR   = ../../../tasktorrent/src
