@@ -9,14 +9,14 @@ set(SOURCES
 
 if(TTOR_SHARED)
     # Enable shared mode only
-    message("Building TaskTorrent in shared memory mode")
+    message(STATUS "Building TaskTorrent in shared memory mode")
     add_compile_options(-DTTOR_SHARED)
     add_library(TaskTorrent STATIC ${SOURCES})
     target_compile_options(TaskTorrent PUBLIC "-DTTOR_SHARED")
 else()
     # Adding communications routines
-    message("Building TaskTorrent in distributed memory mode")    
-    list(APPEND SOURCES communications.cpp threadpool_mpi.cpp active_messages.cpp message.cpp)
+    message(STATUS "Building TaskTorrent in distributed memory mode")    
+    list(APPEND SOURCES communications.cpp threadpool_dist.cpp active_messages.cpp message.cpp mpi_utils.cpp)
     add_library(TaskTorrent STATIC ${SOURCES})
     find_package(MPI REQUIRED)
     target_link_libraries(TaskTorrent PUBLIC MPI::MPI_CXX)
