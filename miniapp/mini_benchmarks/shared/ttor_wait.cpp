@@ -6,7 +6,7 @@
 #include <map>
 #include <memory>
 
-#include "common.hpp"
+#include "../common.hpp"
 #include "tasktorrent/tasktorrent.hpp"
 
 /**

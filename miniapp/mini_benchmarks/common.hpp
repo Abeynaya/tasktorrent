@@ -5,6 +5,9 @@
 #include <numeric>
 #include <cmath>
 #include <vector>
+#include <array>
+
+typedef std::array<int,2> int2;
 
 std::chrono::time_point<std::chrono::high_resolution_clock> wtime_now() {
     return std::chrono::high_resolution_clock::now();

@@ -5,11 +5,10 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mpi.h>
 
 #include "tasktorrent/tasktorrent.hpp"
-#include "common.hpp"
-
-typedef std::array<int,2> int2;
+#include "../common.hpp"
 
 /**
  * n_rows rows of tasks over n_cols columns
@@ -26,12 +25,26 @@ int wait_chain_deps(const int n_threads,
     std::vector<double> efficiencies;
     std::vector<double> times;
     int n_tasks = n_rows * n_cols;
+    const int my_rank = ttor::comm_rank();
+    const int nranks = ttor::comm_size();
+    const int rows_per_rank = (n_rows + nranks - 1)/nranks;
+    const int rows_my_rank = std::min(rows_per_rank, n_rows - my_rank * rows_per_rank);
+    auto task_2_rank = [rows_per_rank](int2 ij){ return ij[0] / rows_per_rank; };
 
     for(int step = 0; step < repeat; step++) {
 
-        ttor::Threadpool_shared tp(n_threads, verb <= 1 ? 0 : verb, "Wk_");
-        ttor::Taskflow<int2> tf(&tp, verb <= 1 ? 0 : verb);
+        // Initialize the runtime structures
+        ttor::Communicator comm(verb);
+        ttor::Threadpool tp(n_threads, &comm, 0, "Wk_" + std::to_string(my_rank) + "_");
+        ttor::Taskflow<int2>  tf(&tp, 0);
         std::atomic<size_t> n_tasks_ran(0);
+
+        // Trigger task on remote rank
+        auto am = comm.make_active_msg( 
+                [&](int& i, int& j) {
+                    tf.fulfill_promise({i,j});
+                });
+
 
         tf.set_mapping([&](int2 ij) {
             return (ij[0] % n_threads);
@@ -44,7 +57,14 @@ int wait_chain_deps(const int n_threads,
             spin_for_seconds(spin_time);
             if(ij[1] < n_cols-1) {
                 for(int k = 0; k < n_edges; k++) {
-                    tf.fulfill_promise({ (ij[0] + k) % n_rows, ij[1]+1 });
+                    int i_new = (ij[0] + k) % n_rows;
+                    int j_new = ij[1]+1;
+                    int dest = task_2_rank({i_new,j_new});
+                    if(dest != my_rank) {
+                        am->send(dest, i_new, j_new);
+                    } else {
+                        tf.fulfill_promise({i_new, j_new});
+                    }
                 }
             }
         })
@@ -55,32 +75,38 @@ int wait_chain_deps(const int n_threads,
 
         auto t0 = ttor::wctime();
         for(int k = 0; k < n_rows; k++) {
-            tf.fulfill_promise({k,0});
+            if(task_2_rank({k,0}) == my_rank) {
+                tf.fulfill_promise({k,0});
+            }
         }
         tp.join();
         auto t1 = ttor::wctime();
         double time = ttor::elapsed(t0, t1);
-        if(verb) printf("iteration repeat n_threads n_rows n_edges n_cols spin_time time n_tasks efficiency\n");
-        assert(n_tasks_ran.load() == n_tasks);
+        if(verb) printf("[my_rank] iteration my_rank nranks repeat n_threads n_rows n_edges n_cols spin_time time n_tasks efficiency\n");
+        assert(n_tasks_ran.load() == rows_my_rank * n_cols);
         double speedup = (double)(n_tasks) * (double)(spin_time) / (double)(time);
-        double efficiency = speedup / (double)(n_threads);
+        double efficiency = speedup / (double)(n_threads * nranks);
         efficiencies.push_back(efficiency);
         times.push_back(time);
-        printf("++++ ttordeps %d %d %d %d %d %d %e %e %d %e\n", step, repeat, n_threads, n_rows, n_edges, n_cols, spin_time, time, n_tasks, efficiency);
-
+        printf("[%d]++++ ttordepsmpi %d %d %d %d %d %d %d %d %e %e %d %e\n", my_rank, step, my_rank, nranks, repeat, n_threads, n_rows, n_edges, n_cols, spin_time, time, n_tasks, efficiency);
     }
 
     double eff_mean, eff_std, time_mean, time_std;
     compute_stats(efficiencies, &eff_mean, &eff_std);
     compute_stats(times, &time_mean, &time_std);
-    if(verb) printf("repeat n_threads n_rows n_edges n_cols spin_time n_tasks efficiency_mean efficiency_std time_mean time_std\n");
-    printf(">>>> ttordeps %d %d %d %d %d %e %d %e %e %e %e\n", repeat, n_threads, n_rows, n_edges, n_cols, spin_time, n_tasks, eff_mean, eff_std, time_mean, time_std);
+    if(verb) printf("[my_rank] my_rank nranks repeat n_threads n_rows n_edges n_cols spin_time n_tasks efficiency_mean efficiency_std time_mean time_std\n");
+    printf("[%d]>>>> ttordepsmpi %d %d %d %d %d %d %d %e %d %e %e %e %e\n", my_rank, my_rank, nranks, repeat, n_threads, n_rows, n_edges, n_cols, spin_time, n_tasks, eff_mean, eff_std, time_mean, time_std);
 
     return 0;
 }
 
 int main(int argc, char **argv)
 {
+    int req = MPI_THREAD_FUNNELED;
+    int prov = -1;
+    MPI_Init_thread(NULL, NULL, req, &prov);
+    assert(prov == req);
+
     int n_threads = 1;
     int n_rows = 10;
     int n_edges = 10;
@@ -128,5 +154,6 @@ int main(int argc, char **argv)
     if(verb) printf("./ttor_deps n_threads n_rows n_edges n_cols spin_time repeat verb\n");
     int error = wait_chain_deps(n_threads, n_rows, n_edges, n_cols, spin_time, repeat, verb);
 
+    MPI_Finalize();
     return error;
 }
