@@ -57,21 +57,6 @@ def make_dag_figure(nodes, edges, show_edges):
     # Create figure
     plot = figure(title="Task graph", x_range=(minx-10,maxx+10), y_range=(miny-10,maxy+10))
 
-    # Nodes
-    dV = nodes
-    V = ColumnDataSource(dV)
-
-    TOOLTIPS = [
-    
-        ("task", "@task"),
-        ("t", "@time"),
-    ]   
-    KINDS = list(pd.unique(nodes['kind']))
-
-    color_mapper = CategoricalColorMapper(palette=Category10_3, factors=KINDS)
-    color = {'field': 'kind', 'transform': color_mapper}
-    model_nodes = plot.circle('x', 'y', source=V, color=color, alpha=1.0, size=4)
-
     # Edges
     if show_edges:
         dE = pd.DataFrame({
@@ -80,6 +65,20 @@ def make_dag_figure(nodes, edges, show_edges):
         })
         E = ColumnDataSource(dE)
         model_edges = plot.multi_line('xs', 'ys', source=E, color='black', line_width=1)
+
+    # Nodes
+    dV = nodes
+    V = ColumnDataSource(dV)
+
+    TOOLTIPS = [
+        ("task", "@task"),
+        ("t", "@time"),
+    ]   
+    KINDS = list(pd.unique(nodes['kind']))
+
+    color_mapper = CategoricalColorMapper(palette=Category10_3, factors=KINDS)
+    color = {'field': 'kind', 'transform': color_mapper}
+    model_nodes = plot.circle('x', 'y', source=V, color=color, alpha=1.0, size=4)
 
     # Around
     plot.add_tools(HoverTool(renderers=[model_nodes], tooltips=TOOLTIPS))
