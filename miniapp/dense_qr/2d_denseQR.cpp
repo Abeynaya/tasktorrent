@@ -91,8 +91,8 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                 if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
 
             } else {
-                Mat[{i,j}] = MatrixXd::Zero(n, n);
-                if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
+                Mat[{i,j}] = MatrixXd::Zero(0,0);
+                if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
             
             }
         }
