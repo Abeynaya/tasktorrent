@@ -59,11 +59,7 @@ int denseQR(int n_threads, int n, int N, int p, int q)
             }
         }
     };
-    MatrixXd A = MatrixXd::NullaryExpr(N * n, N * n, gen);
 
-    MatrixXd Aref = A;
-
-    MatrixXd Tmat = MatrixXd::Zero(N*n, N*n);
 
     // Mapper
     auto block2rank = [&](int2 ij){
@@ -76,6 +72,9 @@ int denseQR(int n_threads, int n, int N, int p, int q)
         return r;
     };
 
+    VectorXd x;
+    VectorXd b;
+    VectorXd bref;
 
     // Block the matrix for every node
     // Store it in a map
@@ -84,19 +83,30 @@ int denseQR(int n_threads, int n, int N, int p, int q)
     map<int2, MatrixXd> Mat;
     map<int2, MatrixXd> T;
 
-    for(int i = 0; i < N; i++) {
-        for (int j=0; j < N; j++){
-            if(block2rank({i,j}) == rank) {
-                Mat[{i,j}] = A.block(i*n, j * n, n, n);
-                if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
+    {
+        MatrixXd A = MatrixXd::NullaryExpr(N * n, N * n, gen);
+       
+        if(rank == 0) {
+            x = VectorXd::Random(n * N);
+            b = A*x;
+            bref = b;
+        }
 
-            } else {
-                Mat[{i,j}] = MatrixXd::Zero(0,0);
-                if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
+
+        for(int i = 0; i < N; i++) {
+            for (int j=0; j < N; j++){
+                if(block2rank({i,j}) == rank) {
+                    Mat[{i,j}] = A.block(i*n, j * n, n, n);
+                    if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
+
+                } else {
+                    Mat[{i,j}] = MatrixXd::Zero(0,0);
+                    if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
             
+                }
             }
         }
-    }
+    }// A gets deleted here
 
     // Factorize
     {
@@ -446,21 +456,32 @@ int denseQR(int n_threads, int n, int N, int p, int q)
         // 3 active messages with different data
         auto am_gather_0 = comm.make_active_msg(
         [&](view<double> &R_j, view<double> &V_ij, view<double> &T_ij,  int& i, int& j) {
-            A.block(0, j*n, (j+1)*n, n) = Map<MatrixXd>(R_j.data(), (j+1)*n, n) ;
-
-            A.block(i*n, j*n, n, n) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
-            Tmat.block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
+            // A.block(0, j*n, (j+1)*n, n) = Map<MatrixXd>(R_j.data(), (j+1)*n, n) ;
+            MatrixXd Rtemp = Map<MatrixXd>(R_j.data(), (j+1)*n, n) ;
+            for (int k=0; k<j+1; ++k){
+                Mat.at({k,j}) = Rtemp.block(k*n, 0, n, n);
+            }
+            // A.block(i*n, j*n, n, n) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
+            // Tmat.block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
+            Mat.at({i,j}) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
+            T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
         });
 
         auto am_gather_1 = comm.make_active_msg(
         [&](view<double> &V_ij, view<double> &T_ij,  int& i, int& j) {
-            A.block(i*n, j*n, n, n) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
-            Tmat.block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
+            // A.block(i*n, j*n, n, n) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
+            // Tmat.block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
+
+            Mat.at({i,j}) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
+            T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
+
         });
 
         auto am_gather_2 = comm.make_active_msg(
         [&](view<double> &T_ij,  int& i, int& j) {
-            Tmat.block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
+            // Tmat.block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
+            T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
+
         });
 
         // gather
@@ -496,24 +517,7 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                         auto T_ij = view<double>(T.at({i,j}).data(), n*n);
                         am_gather_2->send(0, T_ij, i, j);
                     }
-                } else {
-                    if (i == N-1){
-                        for (int k=0; k< j+1; ++k){ 
-                            A.block(k*n, j*n, n, n) = Mat.at({k,j}); // R[:,j] of A = QR
-                        }
-                        A.block(i*n, j*n, n, n) = Mat.at({i, j}); // Last block
-                        Tmat.block(i*n, j*n, n, n) = T.at({i,j});
-                    }
-                    else if (i > j){
-                        A.block(i*n, j*n, n, n) = Mat.at({i,j}); // just that block; contains V
-                        Tmat.block(i*n, j*n, n, n) = T.at({i,j});
-                    }
-                    else {
-                        assert(i == j);
-                        // Send T
-                        Tmat.block(i*n, j*n, n, n) = T.at({i,j});
-                    }
-                }
+                } 
             })
             .set_name([](int2 ij) {
                 return "gather_"+ to_string(ij[0]) + "_" +to_string(ij[1]);
@@ -533,41 +537,42 @@ int denseQR(int n_threads, int n, int N, int p, int q)
 
 
         if(rank == 0) {
-            // Test 1         
-            {
-                auto R = A.triangularView<Upper>();
-                VectorXd x = VectorXd::Random(n * N);
-                VectorXd b = Aref*x;
-                VectorXd bref = b;
+            // Test 1   
+            // Q^T b
+            for (int j = 0; j < N; ++j){
+                // MatrixXd Ajj = A.block(j*n, j*n, n, n);
+                // MatrixXd Tjj = Tmat.block(j*n, j*n, n, n);
+                // MatrixXd Tjj = T.at({j,j});
 
-                // Q^T b
-                for (int j = 0; j < N; ++j){
-                    MatrixXd Ajj = A.block(j*n, j*n, n, n);
-                    MatrixXd Tjj = Tmat.block(j*n, j*n, n, n);
+                int info = LAPACKE_dlarfb(LAPACK_COL_MAJOR, 'L', 'T', 'F', 'C', n, 1, n, Mat.at({j,j}).data(), n, 
+                                          T.at({j,j}).data(), n, b.segment(j*n, n).data(), n);
+                assert(info == 0);
 
-                    int info = LAPACKE_dlarfb(LAPACK_COL_MAJOR, 'L', 'T', 'F', 'C', n, 1, n, Ajj.data(), n, 
-                                              Tjj.data(), n, b.segment(j*n, n).data(), n);
-                    assert(info == 0);
+                for (int i=j+1; i < N; ++i){
+                    info = LAPACKE_dtpmqrt(LAPACK_COL_MAJOR, 'L', 'T', n, 1, n, 0, n, 
+                                               Mat.at({i,j}).data(), n,
+                                               T.at({i,j}).data(), n,
+                                               b.segment(j*n, n).data(), n,
+                                               b.segment(i*n, n).data(), n);
+                    assert(info ==0);
 
-                    for (int i=j+1; i < N; ++i){
-
-                        MatrixXd Aij = A.block(i*n, j*n, n, n);
-                        MatrixXd Tij = Tmat.block(i*n, j*n, n, n);
-                        info = LAPACKE_dtpmqrt(LAPACK_COL_MAJOR, 'L', 'T', n, 1, n, 0, n, 
-                                                   Aij.data(), n,
-                                                   Tij.data(), n,
-                                                   b.segment(j*n, n).data(), n,
-                                                   b.segment(i*n, n).data(), n);
-                        assert(info ==0);
-
-                    }
                 }
-                
-                R.solveInPlace(b);
-                double error = (b - x).norm() / x.norm();
-                cout << "Error solve: " << error << endl;
-                assert(error<=1e-8);
             }
+
+            // R^{-1}b
+            for (int i= N-1; i>-1; --i){
+                for (int j=N-1; j>i; --j){
+                    b.segment(i*n, n) -= Mat.at({i,j})*b.segment(j*n,n);
+                }
+                auto R = Mat.at({i,i}).triangularView<Upper>();
+                VectorXd y = b.segment(i*n, n);
+                R.solveInPlace(y);
+                b.segment(i*n, n) = y;
+            }
+            
+            double error = (b - x).norm() / x.norm();
+            cout << "Error solve: " << error << endl;
+            assert(error<=1e-8);
         }
     }
     return 0;
