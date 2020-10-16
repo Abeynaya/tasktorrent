@@ -129,48 +129,106 @@ int denseQR(int n_threads, int n, int N, int p, int q)
         }
         
         // Active messages
-        // From dgeqrt
-        auto am_dgeqrt_2_dlarfb = comm.make_active_msg(
-            [&](view<double> &V, view<double> &tau, view<int>& js, int& k){
-                Mat.at({k,k}) = Map<MatrixXd>(V.data(), n, n); // Check strides
-                T.at({k,k})   = Map<MatrixXd>(tau.data(), n, n);
+        auto am_dgeqrt_2_dlarfb_Mat = comm.make_large_active_msg(
+            [&](int& k, view<int>& js){
                 for (auto& j: js){
                     dlarfb_tf.fulfill_promise({k,j});
                 }
+                return ;
+            },
+            [&](int& k, view<int>& ){
+                Mat.at({k,k}).resize(n,n);
+                return Mat.at({k,k}).data();
+            },
+            [&](int& , view<int>& ){
+                return ;
             }
         );
 
-        auto am_dgeqrt_2_dtsqrt = comm.make_active_msg(
-            [&](view<double> &R, int& k){
-                Mat.at({k,k}) = Map<MatrixXd>(R.data(), n, n); // Check strides
+        auto am_dgeqrt_2_dlarfb_T = comm.make_large_active_msg(
+            [&](int& k, view<int>& js){
+                for (auto& j: js){
+                    dlarfb_tf.fulfill_promise({k,j});
+                }
+                return ;
+            },
+            [&](int& k, view<int>& ){
+                T.at({k,k}).resize(n,n);
+                return T.at({k,k}).data();
+            },
+            [&](int& , view<int>& ){
+                return ;
+            }
+        );
+
+        auto am_dgeqrt_2_dtsqrt = comm.make_large_active_msg(
+            [&](int& k){
                 dtsqrt_tf.fulfill_promise({k+1,k});
+            },
+            [&](int& k){
+                Mat.at({k,k}).resize(n,n);
+                return Mat.at({k,k}).data();
+            },
+            [&](int& ){
+                return ;
             }
         );
 
         // From dsqrt
-        auto am_dtsqrt_2_dtsqrt = comm.make_active_msg(
-            [&](view<double> &R, int& i, int& k){
-                Mat.at({k,k}) = Map<MatrixXd>(R.data(), n, n); // Check strides
+        auto am_dtsqrt_2_dtsqrt = comm.make_large_active_msg(
+            [&](int& i, int& k){
                 dtsqrt_tf.fulfill_promise({i,k});
+            },
+            [&](int& i, int& k){
+                Mat.at({k,k}).resize(n,n);
+                return Mat.at({k,k}).data();
+            },
+            [&](int& , int& ){
+                return ;
             }
         );
 
-        auto am_dtsqrt_2_dssrfb = comm.make_active_msg(
-            [&](view<double> &V_ik, view<double> &T_ik, int& i, view<int>& js, int& k){
-                Mat.at({i,k}) = Map<MatrixXd>(V_ik.data(), n, n); 
-                T.at({i,k}) = Map<MatrixXd>(T_ik.data(), n, n); 
-
+        auto am_dtsqrt_2_dssrfb_Mat = comm.make_large_active_msg(
+            [&](int& i, int& k, view<int>& js){
                 for(auto& j: js){
                     dssrfb_tf.fulfill_promise({i,j,k}); 
                 }
+            },
+            [&](int& i, int& k, view<int>&){
+                Mat.at({i,k}).resize(n,n);
+                return Mat.at({i,k}).data();
+            },
+            [&](int& , int& , view<int>&){
+                return ;
+            }
+        );
+
+        auto am_dtsqrt_2_dssrfb_T = comm.make_large_active_msg(
+            [&](int& i, int& k, view<int>& js){
+                for(auto& j: js){
+                    dssrfb_tf.fulfill_promise({i,j,k}); 
+                }
+            },
+            [&](int& i, int& k, view<int>&){
+                T.at({i,k}).resize(n,n);
+                return T.at({i,k}).data();
+            },
+            [&](int& , int& , view<int>&){
+                return ;
             }
         );
 
         // From dlarfb
-        auto am_dlarfb_2_dssrfb = comm.make_active_msg(
-            [&](view<double> &R, int& i, int&j,  int& k){
-                Mat.at({k,j}) = Map<MatrixXd>(R.data(), n, n); // Check strides
+        auto am_dlarfb_2_dssrfb = comm.make_large_active_msg(
+            [&](int& i, int&j,  int& k){
                 dssrfb_tf.fulfill_promise({i,j,k});
+            },
+            [&](int& i, int&j,  int& k){
+                Mat.at({k,j}).resize(n,n);
+                return Mat.at({k,j}).data();
+            },
+            [&](int& , int& , int&){
+                return ;
             }
         );
 
@@ -181,6 +239,19 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                 dssrfb_tf.fulfill_promise({i,j,k});
             }
         );
+
+        // auto am_dssrfb_2_dssrfb = comm.make_large_active_msg(
+        //     [&](int& i, int&j,  int& k){
+        //         dssrfb_tf.fulfill_promise({i,j,k});
+        //     },
+        //     [&](int& , int&j,  int& k){
+        //         Mat.at({k,j}).resize(n,n);
+        //         return Mat.at({k,j}).data();
+        //     },
+        //     [&](int& , int& , int&){
+        //         return ;
+        //     }
+        // );
 
 
         // Define taskflows
@@ -215,7 +286,7 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                    }
                    else {
                        auto R_kk = view<double>(Mat.at({k,k}).data(), n * n );
-                       am_dgeqrt_2_dtsqrt->send(r, R_kk, k);
+                       am_dgeqrt_2_dtsqrt->send_large(r, R_kk, k);
                    } 
                 }
                 
@@ -227,14 +298,19 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                     if (r == rank){
                         for(auto& j: p.second){
                             dlarfb_tf.fulfill_promise({k, j}); 
+                            dlarfb_tf.fulfill_promise({k, j}); /// twice tto account for Mat, T 
+
                         }
                     }
                     else {
                         auto V_kk = view<double>(Mat.at({k,k}).data(), n * n );
                         auto T_kk = view<double>(T.at({k,k}).data(), n*n);
                         auto jsv = view<int>(p.second.data(), p.second.size());
-                        am_dgeqrt_2_dlarfb->send(r, V_kk, T_kk, jsv, k);
+
+                        am_dgeqrt_2_dlarfb_Mat->send_large(r, V_kk, k, jsv);
+                        am_dgeqrt_2_dlarfb_T->send_large(r, T_kk, k, jsv);
                     }
+
                 }
 
             })
@@ -272,7 +348,7 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                     else {
                         auto R_kk = view<double>(Mat.at({k,k}).data(), n * n );
                         int inext = i+1;
-                        am_dtsqrt_2_dtsqrt->send(r, R_kk, inext, k) ; // send A{k,k}
+                        am_dtsqrt_2_dtsqrt->send_large(r, R_kk, inext, k) ; // send A{k,k}
                     }
                 }
                 
@@ -293,6 +369,8 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                     if (r == rank){
                         for(auto& j: p.second){
                             dssrfb_tf.fulfill_promise({i,j,k}); 
+                            dssrfb_tf.fulfill_promise({i,j,k}); // twice
+
                         }
                     }
                     else {
@@ -300,7 +378,10 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                         auto T_ik = view<double>(T.at({i,k}).data(), n*n);
                         auto jsv = view<int>(p.second.data(), p.second.size());
 
-                        am_dtsqrt_2_dssrfb->send(r, V_ik, T_ik, i, jsv, k);
+                        // am_dtsqrt_2_dssrfb->send(r, V_ik, T_ik, i, jsv, k);
+                        am_dtsqrt_2_dssrfb_Mat->send_large(r, V_ik,  i, k, jsv);
+                        am_dtsqrt_2_dssrfb_T->send_large(r, T_ik, i, k, jsv);
+
                     }
                 }
 
@@ -317,7 +398,7 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                 return ((kj[0] + kj[1]*N) % n_threads);
             })
             .set_indegree([](int2 kj){
-                return (kj[0] == 0 ? 0 : 1) + 1;
+                return (kj[0] == 0 ? 0 : 1) + 2;
             })
             .set_task([&] (int2 kj) {
 
@@ -340,7 +421,7 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                     else {
                         auto R_kj = view<double>(Mat.at({k,j}).data(), n * n ); 
                         int knext = k+1;
-                        am_dlarfb_2_dssrfb->send(r, R_kj, knext, j, k); //send R_kj
+                        am_dlarfb_2_dssrfb->send_large(r, R_kj, knext, j, k); //send R_kj
                     }
                 }
                 
@@ -361,7 +442,7 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                 int j = ijk[1];
                 int k = ijk[2];
 
-                return (k==0 ? 2 : 3);
+                return (k==0 ? 2 : 3)+1;
 
             })
             .set_task([&] (int3 ijk) {
@@ -390,7 +471,9 @@ int denseQR(int n_threads, int n, int N, int p, int q)
                     else {
                         auto R_kj = view<double>(Mat.at({k,j}).data(), n * n ); 
                         int inext = i+1;
-                        am_dssrfb_2_dssrfb->send(r, R_kj, inext, j, k);  
+                        am_dlarfb_2_dssrfb->send_large(r, R_kj, inext, j, k);  
+                        // am_dssrfb_2_dssrfb->send(r, R_kj, inext, j, k);  
+
                     }
                 }
                 
