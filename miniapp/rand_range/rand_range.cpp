@@ -51,6 +51,7 @@ struct denseQR {
     Taskflow<int2> dlarfb_tf;
     Taskflow<int3> dssrfb_tf;
     Taskflow<int2> gather_tf;
+    Taskflow<int> computeQ_tf;
 
     /** Taskflows obtained from parent function **/
     Taskflow<int>* notify_tf;
@@ -69,6 +70,7 @@ struct denseQR {
     /** Matrix A (input and output) **/
     MatrixXd* A;
     MatrixXd* Tmat;
+    MatrixXd* Q;
     int p; // No. of ranks in x dim
     int q; // No. of ranks in y dim
     int n; // block size
@@ -82,7 +84,7 @@ struct denseQR {
     /* Constructor */
     denseQR(Communicator* comm_, Threadpool* tp_, Taskflow<int>* notify_tf_): rank(comm_->comm_rank()),
     nranks(comm_->comm_size()), n_threads(tp_->size()), comm(comm_), tp(tp_), notify_tf(notify_tf_),
-    dgeqrt_tf(tp), dtsqrt_tf(tp), dlarfb_tf(tp), dssrfb_tf(tp), gather_tf(tp) {
+    dgeqrt_tf(tp), dtsqrt_tf(tp), dlarfb_tf(tp), dssrfb_tf(tp), gather_tf(tp), computeQ_tf(tp) {
 
         // Mat and T size ??? 
 
@@ -157,7 +159,6 @@ struct denseQR {
 
                 for(int j = k+1; j<N; j++) { // A[k][j] blocks
                     int r = (k%p)+ (j%q)*p;
-                    cout << r << endl;
                     if(to_fulfill.count(r) == 0) {
                         to_fulfill[r] = {j};
                     } else {
@@ -404,7 +405,7 @@ struct denseQR {
             Tmat->block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
             // Mat.at({i,j}) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
             // T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
-            notify_tf->fulfill_promise(0);
+            computeQ_tf.fulfill_promise(0);
         });
 
         am_gather_1 = comm->make_active_msg(
@@ -414,7 +415,7 @@ struct denseQR {
 
             // Mat.at({i,j}) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
             // T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
-            notify_tf->fulfill_promise(0);
+            computeQ_tf.fulfill_promise(0);
 
 
         });
@@ -423,7 +424,7 @@ struct denseQR {
         [&](view<double> &T_ij,  int& i, int& j) {
             Tmat->block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
             // T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
-            notify_tf->fulfill_promise(0);
+            computeQ_tf.fulfill_promise(0);
 
 
         });
@@ -469,19 +470,19 @@ struct denseQR {
                         }
                         A->block(i*n, j*n, n, n) = Mat.at({i, j}); // Last block
                         Tmat->block(i*n, j*n, n, n) = T.at({i,j});
-                        notify_tf->fulfill_promise(0);
+                        computeQ_tf.fulfill_promise(0);
                     }
                     else if (i > j){
                         A->block(i*n, j*n, n, n) = Mat.at({i,j}); // just that block; contains V
                         Tmat->block(i*n, j*n, n, n) = T.at({i,j});
-                        notify_tf->fulfill_promise(0);
+                        computeQ_tf.fulfill_promise(0);
 
                     }
                     else {
                         assert(i == j);
                         // Send T
                         Tmat->block(i*n, j*n, n, n) = T.at({i,j});
-                        notify_tf->fulfill_promise(0);
+                        computeQ_tf.fulfill_promise(0);
 
                     }
                 }
@@ -490,12 +491,69 @@ struct denseQR {
                 return "gather_"+ to_string(ij[0]) + "_" +to_string(ij[1]);
             });
 
+
+            computeQ_tf.set_task([&] (int k){
+                for (int j = N-1; j > -1; --j){
+
+                    for (int k=0; k<N; ++k){
+                        for (int i=M-1; i > j; --i){
+                            MatrixXd Aij = A->block(i*n, j*n, n, n);
+                            MatrixXd Tij = Tmat->block(i*n, j*n, n, n);
+                            // assert(Q->cols() == N*n);
+                            MatrixXd Qi = Q->block(i*n, k*n, n, n);
+                            MatrixXd Qj = Q->block(j*n, k*n, n, n);
+
+                            int info = LAPACKE_dtpmqrt(LAPACK_COL_MAJOR, 'L', 'N', n, n, n, 0, n, 
+                                                       Aij.data(), n,
+                                                       Tij.data(), n,
+                                                       Qj.data(), n,
+                                                       Qi.data(), n);
+                            Q->block(i*n, k*n, n, n) = Qi;
+                            Q->block(j*n, k*n, n, n) = Qj;
+
+                            assert(info ==0);
+                        }
+
+                    }
+                    
+                    MatrixXd Ajj = A->block(j*n, j*n, n, n);
+                    MatrixXd Tjj = Tmat->block(j*n, j*n, n, n);
+                    MatrixXd Qjj = Q->block(j*n, 0, n, N*n);
+
+                    int info = LAPACKE_dlarfb(LAPACK_COL_MAJOR, 'L', 'N', 'F', 'C', n, N*n, n, Ajj.data(), n, 
+                                              Tjj.data(), n, Qjj.data(), n);
+
+                    Q->block(j*n, 0, n, N*n) = Qjj;
+
+                    assert(info == 0);
+
+                }
+            })
+            .set_indegree([&] (int k){
+                return (M* (M +1)/2 - (M-N)*(M-N+1)/2);
+            })
+            .set_mapping([&] (int k){
+                return (k % n_threads);
+            })
+            .set_name([&](int k) {
+                return "computeQ_tf_" + to_string(k);
+            })
+            .set_fulfill([&](int k){
+                notify_tf->fulfill_promise(0);
+            });
+
+
+
+
+            
+
     }
 
     /** Function **/
-    void run(MatrixXd* Y_, MatrixXd* Tmat_, int block_size, int p1, int q1){
+    void run(MatrixXd* Y_, MatrixXd* Tmat_, MatrixXd* Q_, int block_size, int p1, int q1){
         this->A = Y_; // A to be performed QR on 
         this->Tmat = Tmat_;  
+        this->Q = Q_; // thin Q
 
         p = p1;
         q = q1;
@@ -558,8 +616,12 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
     int samp=10; // Oversampling parameter
     
     MatrixXd A;
-    MatrixXd Y;
-    MatrixXd Tmat = MatrixXd::Zero(M*n, N*n); 
+    MatrixXd* Y = new MatrixXd(M*n, N*n);
+    MatrixXd* Q = new MatrixXd(M*n, N*n); 
+    Q->setZero();
+    Q->block(0,0,N*n,N*n) = MatrixXd::Identity(N*n, N*n);
+    MatrixXd* Tmat = new MatrixXd(M*n, N*n); 
+    Tmat->setZero();
 
     {
         std::default_random_engine default_gen = default_random_engine(2020);
@@ -587,13 +649,11 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
         }
         
         // Multiply Y with G
-        Y = A*G; 
-        // Tmat = Y;
-        cout << Y << endl;
+        *Y = A*G; 
     }
 
     // Factorize
-    {
+    // {
         // Initialize the communicator structure
         Communicator comm(MPI_COMM_WORLD, VERB);
 
@@ -605,7 +665,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
             printf("Randomized range finder is done and gathered on node 0\n");
         })
         .set_indegree([&] (int k){
-            return (M* (M +1)/2 - (M-N)*(M-N+1)/2);
+            return 1;
         })
         .set_mapping([&] (int k){
             return (k % n_threads);
@@ -618,7 +678,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
 
 
         timer t0 = wctime();
-        qr.run(&Y, &Tmat, n, p, q);
+        qr.run(Y, Tmat, Q, n, p, q);
         tp.join();
         timer t1 = wctime();
         MPI_Barrier(MPI_COMM_WORLD);
@@ -627,67 +687,16 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
             cout << "Time : " << elapsed(t0, t1) << endl;
         }
 
-    }
 
-    {
-        if(rank == 0) {
-
-            cout << "Entering solve..." << endl;
-            // MatrixXd I = MatrixXd::Identity(N*n, N*n);
-            
-            // Test 1   
-            // Q^T b
-            for (int j = 0; j < N; ++j){
-                MatrixXd Ajj = Y.block(j*n, j*n, n, n);
-                MatrixXd Tjj = Tmat.block(j*n, j*n, n, n);
-
-                int info = LAPACKE_dlarfb(LAPACK_COL_MAJOR, 'L', 'T', 'F', 'C', n, 1, n, Ajj.data(), n, 
-                                          Tjj.data(), n, b.segment(j*n, n).data(), n);
-                assert(info == 0);
-
-
-                for (int i=j+1; i < M; ++i){
-                    MatrixXd Aij = Y.block(i*n, j*n, n, n);
-                    MatrixXd Tij = Tmat.block(i*n, j*n, n, n);
-
-                    info = LAPACKE_dtpmqrt(LAPACK_COL_MAJOR, 'L', 'T', n, 1, n, 0, n, 
-                                               Aij.data(), n,
-                                               Tij.data(), n,
-                                               b.segment(j*n, n).data(), n,
-                                               b.segment(i*n, n).data(), n);
-                    assert(info ==0);
-                    
-
-                }
-            }
-            
-            // Q Q^T b
-            for (int j = N-1; j > -1; --j){
-
-                for (int i=M-1; i > j; --i){
-                    MatrixXd Aij = Y.block(i*n, j*n, n, n);
-                    MatrixXd Tij = Tmat.block(i*n, j*n, n, n);
-                    int info = LAPACKE_dtpmqrt(LAPACK_COL_MAJOR, 'L', 'N', n, 1, n, 0, n, 
-                                               Aij.data(), n,
-                                               Tij.data(), n,
-                                               b.segment(j*n, n).data(), n,
-                                               b.segment(i*n, n).data(), n);
-                    assert(info ==0);
-                }
-
-                MatrixXd Ajj = Y.block(j*n, j*n, n, n);
-                MatrixXd Tjj = Tmat.block(j*n, j*n, n, n);
-                int info = LAPACKE_dlarfb(LAPACK_COL_MAJOR, 'L', 'N', 'F', 'C', n, 1, n, Ajj.data(), n, 
-                                          Tjj.data(), n, b.segment(j*n, n).data(), n);
-                assert(info == 0);
-
-            }
-            
-            double error = (b - bref).norm() / bref.norm();
+        if(rank == 0 && VERB) {
+            double error = (A - (*Q)*(Q->transpose())*A).norm();
             cout << "Error solve: " << error << endl;
-            // assert(error<=1e-8);
         }
-    }
+
+       delete Q;
+       delete Y;
+       delete Tmat;
+
     return 0;
 }
 
@@ -742,6 +751,8 @@ int main(int argc, char **argv)
     }
 
     const int return_flag = rand_range(n_threads_, n_, M_, N_, p_, q_);
+
+    // cout << "returned to main code" << endl;
 
     MPI_Finalize();
 
