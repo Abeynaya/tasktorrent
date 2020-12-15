@@ -101,7 +101,7 @@ struct denseQR {
         });
 
 
-        am_scatter = comm->make_active_msg([&](view<double> &V, view<int> &ind_i, view<int>& ind_j, int& nblocks,
+        am_scatter = comm->make_active_msg([&](view<double> &V, view<int> &ind_i_, view<int>& ind_j_, int& nblocks,
                 int& p_, int& q_, int& n_, int& M_, int& N_, int& notify_index_, int& origin_rank_){
 
                 p = p_;
@@ -122,13 +122,14 @@ struct denseQR {
 
                 // Copy submatrix blocks received from origin
                 MatrixXd Vtemp = Map<MatrixXd>(V.data(), nblocks*n, n);
-                int counter =0;
-                for (auto& i: ind_i){
-                    for (auto& j: ind_j){
-                        Mat[{i,j}] = Vtemp.block(counter*n, 0, n, n);
-                        if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
-                        counter++;
-                    }
+                VectorXi ind_i = Map<VectorXi>(ind_i_.data(), nblocks);
+                VectorXi ind_j = Map<VectorXi>(ind_j_.data(), nblocks);
+                
+                for (int counter=0; counter < nblocks; ++counter){
+                    auto i = ind_i[counter];
+                    auto j = ind_j[counter];
+                    Mat[{i,j}] = Vtemp.block(counter*n, 0, n, n);
+                    if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
                 }
 
                 // Fullfill promise on start_qr_tf
@@ -215,7 +216,7 @@ struct denseQR {
             else return 1;
         })
         .set_task([&] (int k) {
-            cout << " Rank " << rank << "ready to begin QR" << endl;
+            cout << " Rank " << rank << " ready to begin QR" << endl;
             if (rank == origin_rank){
                 dgeqrt_tf.fulfill_promise(0);
             }
@@ -585,8 +586,6 @@ struct denseQR {
             .set_task([&](int2 ij) {
                 int i = ij[0];
                 int j = ij[1];
-                cout << "Gathering..." << i << " " << j << " " << rank << endl;
-
 
                 if(rank != origin_rank) {
                     if (i == M-1) { // Last row contains all the updated R[:, j]
@@ -739,7 +738,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
     VectorXd x ;
     VectorXd b ;
     VectorXd bref ;
-    int samp=0; // Oversampling parameter
+    int samp=10; // Oversampling parameter
     
     MatrixXd A;
     MatrixXd* Y = new MatrixXd(M*n, N*n);
@@ -749,35 +748,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
     MatrixXd* Tmat = new MatrixXd(M*n, N*n); 
     Tmat->setZero();
 
-    // {
-    //     std::default_random_engine default_gen = default_random_engine(2020);
-    //     auto gen_gaussian = [&](int i, int j){ return get_gaussian(i, j, &default_gen); };
-
-
-    //     // Generate a Gaussian random matrix  
-    //     MatrixXd G = gen_gaussian(M*n, N*n); 
-
-
-    //     // Generate a rank deficient matrix
-    //     MatrixXd X = gen_gaussian(M*n, M*n);
-    //     VectorXd d = VectorXd::Zero(M*n);
-    //     d.head(N*n-samp) = 0.1*VectorXd::LinSpaced(N*n-samp,1, N*n-samp);
-
-    //     DiagonalMatrix<double, Eigen::Dynamic> D(M*n);
-    //     D = d.asDiagonal();
-    //     A = X*D*X.inverse();
-
-    //     // We need to find QR of A now
-    //     if(rank == 0) {
-    //         x = VectorXd::Random(n * M);
-    //         b = A*x;
-    //         bref = b;
-    //     }
-        
-    //     // Multiply Y with G
-    //     *Y = A*G; 
-    // }
-
+    int origin = 1;
     // Factorize
     // {
         // Initialize the communicator structure
@@ -827,35 +798,31 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
             D = d.asDiagonal();
             A = X*D*X.inverse();
 
-            // We need to find QR of A now
+            // We need to find QR of Y now
             x = VectorXd::Random(n * M);
             b = A*x;
             bref = b;
             
             // Multiply Y with G
             *Y = A*G; 
-            cout << *Y << endl << endl;
 
             qr.run(Y, Tmat, Q, n, 0);
         });
 
         timer t0 = wctime();
-        if (rank == 0){
+        if (rank == origin){
             sparsify_tf.fulfill_promise(0);
         }
         tp.join();
         timer t1 = wctime();
         MPI_Barrier(MPI_COMM_WORLD);
-        if(rank == 0)
+        if(rank == origin)
         {
             cout << "Time : " << elapsed(t0, t1) << endl;
         }
 
 
-        if(rank == 0 && VERB) {
-            // cout << A << endl << endl;
-            cout << *Y << endl << endl;
-            cout << *Q << endl << endl;
+        if(rank == origin && VERB) {
             double error = (A - (*Q)*(Q->transpose())*A).norm();
             cout << "Error solve: " << error << endl;
         }
