@@ -14,7 +14,7 @@
 #include <iostream>
 #include <map>
 #include <tuple>
-// #include <gtest/gtest.h>
+
 #include <mpi.h>
 
 #include "tasktorrent/tasktorrent.hpp"
@@ -46,17 +46,23 @@ struct denseQR {
     Threadpool* tp;
 
     /** Task flows needed **/
+    Taskflow<int> scatter_tf; // from origin to helper ranks
+    Taskflow<int> start_qr_tf; // All helper ranks are ready 
     Taskflow<int> dgeqrt_tf;  // A[k,k] = QR
     Taskflow<int2> dtsqrt_tf;
     Taskflow<int2> dlarfb_tf;
     Taskflow<int3> dssrfb_tf;
     Taskflow<int2> gather_tf;
-    Taskflow<int> computeQ_tf;
+    Taskflow<int> computeQ_tf; // from helper ranks to origin
 
     /** Taskflows obtained from parent function **/
     Taskflow<int>* notify_tf;
 
     /** Active messages between tasks **/
+    ActiveMsg<>* am_start_qr;
+    ActiveMsg<view<double>,view<int>,view<int>, 
+              int, int , int, int , int , int , int , int>* am_scatter;
+
     ActiveMsg<view<double>,view<double>,view<int>,int>* am_dgeqrt_2_dlarfb;
     ActiveMsg<view<double>,int>* am_dgeqrt_2_dtsqrt;
     ActiveMsg<view<double>,int, int>* am_dtsqrt_2_dtsqrt;
@@ -76,17 +82,155 @@ struct denseQR {
     int n; // block size
     int M; // no. of blocks in y dim
     int N; // no. of blocks in x dim
+    int notify_index; // Which notify_tf parent task to notify about completion
+    int origin_rank; // Which rank to gather output on
 
-    /** Workspace **/
+    /** Workspace **/ // Need to more general ... workspace[origin_rank] = map<int2, MatrixXd> 
     map<int2, MatrixXd> Mat;
     map<int2, MatrixXd> T;
 
     /* Constructor */
     denseQR(Communicator* comm_, Threadpool* tp_, Taskflow<int>* notify_tf_): rank(comm_->comm_rank()),
     nranks(comm_->comm_size()), n_threads(tp_->size()), comm(comm_), tp(tp_), notify_tf(notify_tf_),
-    dgeqrt_tf(tp), dtsqrt_tf(tp), dlarfb_tf(tp), dssrfb_tf(tp), gather_tf(tp), computeQ_tf(tp) {
+    scatter_tf(tp), start_qr_tf(tp), dgeqrt_tf(tp), dtsqrt_tf(tp), dlarfb_tf(tp), dssrfb_tf(tp), gather_tf(tp), computeQ_tf(tp) {
 
-        // Mat and T size ??? 
+
+        // Message from helper ranks saying they are ready to begin computation
+        am_start_qr = comm->make_active_msg([&] () {
+            start_qr_tf.fulfill_promise(0);
+        });
+
+
+        am_scatter = comm->make_active_msg([&](view<double> &V, view<int> &ind_i, view<int>& ind_j, int& nblocks,
+                int& p_, int& q_, int& n_, int& M_, int& N_, int& notify_index_, int& origin_rank_){
+
+                p = p_;
+                q = q_;
+                n = n_;
+                M = M_;
+                N = N_;
+                notify_index = notify_index_;
+                origin_rank = origin_rank_;
+
+                // initialize workspace
+                for (int i=0; i < M; ++i){
+                    for (int j=0; j < N; ++j){
+                        Mat[{i,j}] = MatrixXd::Zero(0,0);
+                        if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
+                    }
+                }
+
+                // Copy submatrix blocks received from origin
+                MatrixXd Vtemp = Map<MatrixXd>(V.data(), nblocks*n, n);
+                int counter =0;
+                for (auto& i: ind_i){
+                    for (auto& j: ind_j){
+                        Mat[{i,j}] = Vtemp.block(counter*n, 0, n, n);
+                        if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
+                        counter++;
+                    }
+                }
+
+                // Fullfill promise on start_qr_tf
+                start_qr_tf.fulfill_promise(0);
+            }
+        );
+
+        // From origin to helper ranks
+        scatter_tf.set_mapping([&] (int k){
+            return (k % n_threads);
+        })
+        .set_indegree([](int){
+            return 1;
+        })
+        .set_task([&] (int k) {
+            assert(rank == origin_rank);
+            // Mapper
+            auto block2rank = [&](int2 ij){
+                int i = ij[0];
+                int j = ij[1];
+                int ii = i % p;
+                int jj = j % q;
+                int r = (ii + jj * p + origin_rank) % nranks;
+                assert(r <= nranks);
+                return r;
+            };
+
+            vector<map<int2, MatrixXd>> rank2matrix(nranks);
+
+            for(int i = 0; i < M; i++) {
+                for (int j=0; j < N; j++){
+                    if (block2rank({i,j}) != origin_rank){
+                        rank2matrix[block2rank({i,j})][{i,j}] = A->block(i*n, j*n, n, n);
+                        // In local workspace
+                        Mat[{i,j}] = MatrixXd::Zero(0,0);
+                        if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
+                    }
+                    else {
+                        Mat[{i,j}] = A->block(i*n, j*n, n, n);
+                        if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
+
+                    }
+                }
+            }
+
+            start_qr_tf.fulfill_promise(0); // local 
+
+            // Send blocks to other ranks 
+            for (int i=0; i < nranks; ++i){
+                if (i != origin_rank){
+                    int msize = rank2matrix[i].size();
+                    MatrixXd submatrix = MatrixXd::Zero(msize*n, n); // Each block is of size n by n
+                    vector<int> ind_i(msize);
+                    vector<int> ind_j(msize);
+                    int counter =0;
+                    for (auto m: rank2matrix[i]){ // go through the map
+                        ind_i[counter] = m.first[0];
+                        ind_j[counter] = m.first[1];
+                        submatrix.block(counter*n, 0, n, n) = m.second;
+                        counter++;
+                    }
+                    auto submatrix_view = view<double>(submatrix.data(), msize*n*n);
+                    auto ind_i_view = view<int>(ind_i.data(), msize);
+                    auto ind_j_view = view<int>(ind_j.data(), msize);
+
+                    am_scatter->send(i, submatrix_view, ind_i_view, ind_j_view,  msize, p, q, n, M, N, notify_index, origin_rank);
+                }
+            }
+
+        })
+        .set_name([](int k) {
+            return "scatter_" + to_string(k);
+        })
+        .set_priority([&](int) {
+            return 6;
+        });
+
+        start_qr_tf.set_mapping([&] (int k){
+            return k % n_threads;
+        })
+        .
+        set_indegree([&] (int) {
+            if (rank == origin_rank) return nranks;
+            else return 1;
+        })
+        .set_task([&] (int k) {
+            cout << " Rank " << rank << "ready to begin QR" << endl;
+            if (rank == origin_rank){
+                dgeqrt_tf.fulfill_promise(0);
+            }
+            else {
+                // Send a message to origin rank
+                am_start_qr->send(origin_rank);
+            }
+        })
+        .set_name([](int k) {
+            return "start_qr_" + to_string(k);
+        })
+        .set_priority([&](int) {
+            return 6;
+        });
+
 
         // From dgeqrt
         am_dgeqrt_2_dlarfb = comm->make_active_msg(
@@ -158,7 +302,7 @@ struct denseQR {
                 map<int, vector<int>> to_fulfill;
 
                 for(int j = k+1; j<N; j++) { // A[k][j] blocks
-                    int r = (k%p)+ (j%q)*p;
+                    int r = ((k%p)+ (j%q)*p + origin_rank) % nranks;
                     if(to_fulfill.count(r) == 0) {
                         to_fulfill[r] = {j};
                     } else {
@@ -169,7 +313,7 @@ struct denseQR {
 
                 // First dtsqrt
                 if (k+1 < M){
-                   int r = ((k+1)%p)+ (k%q)*p;
+                   int r = ((k+1)%p + (k%q)*p + origin_rank) % nranks;;
                    if (r == rank){
                        dtsqrt_tf.fulfill_promise({k+1, k});
                    }
@@ -180,7 +324,7 @@ struct denseQR {
                    } 
                 }
                 
-                // gather on node 0
+                // gather on node origin_rank
                 gather_tf.fulfill_promise({k,k});
 
 
@@ -217,19 +361,21 @@ struct denseQR {
             .set_task([&] (int2 ik) {
                 int i = ik[0];
                 int k = ik[1];
+
                 int info = LAPACKE_dtpqrt(LAPACK_COL_MAJOR, n, n, 0, n, Mat.at({k,k}).data(), n, Mat.at({i,k}).data(), n, T.at({i,k}).data(), n);
                 assert(info == 0);
             })
             .set_fulfill([&](int2 ik) {
                 int i = ik[0];
                 int k = ik[1];
+
                 // Dependencies 
                 map<int, vector<int>> to_fulfill;
                 
                 // Next dtsqrt
                 if (i+1 < M){
                     // int r = block2rank({i+1,k});
-                    int r = ((i+1)%p)+ (k%q)*p;
+                    int r = ((i+1)%p+ (k%q)*p + origin_rank) % nranks;
                     if (r == rank){
                         dtsqrt_tf.fulfill_promise({i+1, k});
                     }
@@ -247,7 +393,7 @@ struct denseQR {
                 // dssrfb
                 for(int j = k+1; j<N; j++) { 
                     // int r = block2rank({i,j}); // ssrfb
-                    int r = (i%p)+ (j%q)*p;
+                    int r = ((i%p)+ (j%q)*p + origin_rank) % nranks;
                     if(to_fulfill.count(r) == 0) {
                         to_fulfill[r] = {j};
                     } else {
@@ -302,7 +448,7 @@ struct denseQR {
                 
                 if (k+1 < M){
                     // int r = block2rank({k+1, j});
-                    int r = ((k+1)%p)+ (j%q)*p;
+                    int r = ((k+1)%p+ (j%q)*p + origin_rank) % nranks;
                     if (r == rank){
                         dssrfb_tf.fulfill_promise({k+1, j, k});
                     }
@@ -353,7 +499,7 @@ struct denseQR {
 
                 if (i+1 < M){
                     // int r = block2rank({i+1,j});
-                    int r = ((i+1)%p)+ (j%q)*p;
+                    int r = ((i+1)%p+ (j%q)*p + origin_rank) % nranks;
                     if (r == rank){
                         dssrfb_tf.fulfill_promise({i+1,j,k});
                     }
@@ -439,8 +585,10 @@ struct denseQR {
             .set_task([&](int2 ij) {
                 int i = ij[0];
                 int j = ij[1];
+                cout << "Gathering..." << i << " " << j << " " << rank << endl;
 
-                if(rank != 0) {
+
+                if(rank != origin_rank) {
                     if (i == M-1) { // Last row contains all the updated R[:, j]
                         MatrixXd Atemp = MatrixXd::Zero( (j+1)*n, n);
                         for (int k=0; k< j+1; ++k){ 
@@ -450,17 +598,17 @@ struct denseQR {
 
                         auto V_ij = view<double>(Mat.at({i,j}).data(), n*n);
                         auto T_ij = view<double>(T.at({i,j}).data(), n*n);
-                        am_gather_0->send(0, R_j, V_ij, T_ij, i, j);
+                        am_gather_0->send(origin_rank, R_j, V_ij, T_ij, i, j);
                     }
                     else if (i > j){ // Just send the V_ij, T_ij
                         auto V_ij = view<double>(Mat.at({i,j}).data(), n*n);
                         auto T_ij = view<double>(T.at({i,j}).data(), n*n);
-                        am_gather_1->send(0, V_ij, T_ij, i, j);
+                        am_gather_1->send(origin_rank, V_ij, T_ij, i, j);
                     }
                     else {
                         assert(i == j);
                         auto T_ij = view<double>(T.at({i,j}).data(), n*n);
-                        am_gather_2->send(0, T_ij, i, j);
+                        am_gather_2->send(origin_rank, T_ij, i, j);
                     }
                 } 
                 else {
@@ -493,6 +641,7 @@ struct denseQR {
 
 
             computeQ_tf.set_task([&] (int k){
+                cout << "Computing_Q" << endl;
                 for (int j = N-1; j > -1; --j){
 
                     for (int k=0; k<N; ++k){
@@ -539,57 +688,34 @@ struct denseQR {
                 return "computeQ_tf_" + to_string(k);
             })
             .set_fulfill([&](int k){
-                notify_tf->fulfill_promise(0);
-            });
-
-
-
-
-            
-
+                notify_tf->fulfill_promise(notify_index);
+            });           
     }
 
     /** Function **/
-    void run(MatrixXd* Y_, MatrixXd* Tmat_, MatrixXd* Q_, int block_size, int p1, int q1){
+    void run(MatrixXd* Y_, MatrixXd* Tmat_, MatrixXd* Q_, int block_size, int k){
+
         this->A = Y_; // A to be performed QR on 
         this->Tmat = Tmat_;  
         this->Q = Q_; // thin Q
 
-        p = p1;
-        q = q1;
+        origin_rank = comm_rank();
+
+        p = pow(2,ceil(log(nranks)/log(2)));
+        q = floor(nranks/p);
+
+        notify_index = k;
 
         M = ceil(Y_->rows()/block_size);
         N = ceil(Y_->cols()/block_size);
 
         n = block_size;
 
-        // Mapper
-        auto block2rank = [&](int2 ij){
-            int i = ij[0];
-            int j = ij[1];
-            int ii = i % p;
-            int jj = j % q;
-            int r = ii + jj * p;
-            assert(r <= nranks);
-            return r;
-        };
-
-        for(int i = 0; i < M; i++) {
-            for (int j=0; j < N; j++){
-                if(block2rank({i,j}) == rank) {
-                    Mat[{i,j}] = Y_->block(i*n, j*n, n, n);
-                    if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
-
-                } else {
-                    Mat[{i,j}] = MatrixXd::Zero(0,0);
-                    if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
-                }
-            }
-        }
-
-        if (rank == 0){
-            dgeqrt_tf.fulfill_promise(0);
-        }
+        
+        scatter_tf.fulfill_promise(0);
+        // if (rank == 0){
+        // dgeqrt_tf.fulfill_promise(0);
+        // }
 
     }
 
@@ -613,7 +739,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
     VectorXd x ;
     VectorXd b ;
     VectorXd bref ;
-    int samp=10; // Oversampling parameter
+    int samp=0; // Oversampling parameter
     
     MatrixXd A;
     MatrixXd* Y = new MatrixXd(M*n, N*n);
@@ -623,34 +749,34 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
     MatrixXd* Tmat = new MatrixXd(M*n, N*n); 
     Tmat->setZero();
 
-    {
-        std::default_random_engine default_gen = default_random_engine(2020);
-        auto gen_gaussian = [&](int i, int j){ return get_gaussian(i, j, &default_gen); };
+    // {
+    //     std::default_random_engine default_gen = default_random_engine(2020);
+    //     auto gen_gaussian = [&](int i, int j){ return get_gaussian(i, j, &default_gen); };
 
 
-        // Generate a Gaussian random matrix  
-        MatrixXd G = gen_gaussian(M*n, N*n); 
+    //     // Generate a Gaussian random matrix  
+    //     MatrixXd G = gen_gaussian(M*n, N*n); 
 
 
-        // Generate a rank deficient matrix
-        MatrixXd X = gen_gaussian(M*n, M*n);
-        VectorXd d = VectorXd::Zero(M*n);
-        d.head(N*n-samp) = 0.1*VectorXd::LinSpaced(N*n-samp,1, N*n-samp);
+    //     // Generate a rank deficient matrix
+    //     MatrixXd X = gen_gaussian(M*n, M*n);
+    //     VectorXd d = VectorXd::Zero(M*n);
+    //     d.head(N*n-samp) = 0.1*VectorXd::LinSpaced(N*n-samp,1, N*n-samp);
 
-        DiagonalMatrix<double, Eigen::Dynamic> D(M*n);
-        D = d.asDiagonal();
-        A = X*D*X.inverse();
+    //     DiagonalMatrix<double, Eigen::Dynamic> D(M*n);
+    //     D = d.asDiagonal();
+    //     A = X*D*X.inverse();
 
-        // We need to find QR of A now
-        if(rank == 0) {
-            x = VectorXd::Random(n * M);
-            b = A*x;
-            bref = b;
-        }
+    //     // We need to find QR of A now
+    //     if(rank == 0) {
+    //         x = VectorXd::Random(n * M);
+    //         b = A*x;
+    //         bref = b;
+    //     }
         
-        // Multiply Y with G
-        *Y = A*G; 
-    }
+    //     // Multiply Y with G
+    //     *Y = A*G; 
+    // }
 
     // Factorize
     // {
@@ -659,7 +785,9 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
 
         // Threadpool
         Threadpool tp(n_threads, &comm, VERB, "[" + to_string(rank) + "]_");
+        Taskflow<int> sparsify_tf(&tp, VERB);
         Taskflow<int> notify_tf(&tp, VERB);
+        denseQR qr(&comm, &tp, &notify_tf); // Every rank does this. 
 
         notify_tf.set_task([&] (int k){
             printf("Randomized range finder is done and gathered on node 0\n");
@@ -674,11 +802,47 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
             return "notify_tf_" + to_string(k);
         });
 
-        denseQR qr(&comm, &tp, &notify_tf); // Every rank does this. 
+        
+        sparsify_tf.set_mapping([&] (int k){
+            return (k % n_threads);
+        })
+        .set_indegree([&] (int k){
+            return 1;
+        })
+        .set_task([&] (int k){
+            printf("Modelling the sparsify task; call the RRQR function\n");
+            std::default_random_engine default_gen = default_random_engine(2020);
+            auto gen_gaussian = [&](int i, int j){ return get_gaussian(i, j, &default_gen); };
 
+
+            // Generate a Gaussian random matrix  
+            MatrixXd G = gen_gaussian(M*n, N*n); 
+
+            // Generate a rank deficient matrix
+            MatrixXd X = gen_gaussian(M*n, M*n);
+            VectorXd d = VectorXd::Zero(M*n);
+            d.head(N*n-samp) = 0.1*VectorXd::LinSpaced(N*n-samp,1, N*n-samp);
+
+            DiagonalMatrix<double, Eigen::Dynamic> D(M*n);
+            D = d.asDiagonal();
+            A = X*D*X.inverse();
+
+            // We need to find QR of A now
+            x = VectorXd::Random(n * M);
+            b = A*x;
+            bref = b;
+            
+            // Multiply Y with G
+            *Y = A*G; 
+            cout << *Y << endl << endl;
+
+            qr.run(Y, Tmat, Q, n, 0);
+        });
 
         timer t0 = wctime();
-        qr.run(Y, Tmat, Q, n, p, q);
+        if (rank == 0){
+            sparsify_tf.fulfill_promise(0);
+        }
         tp.join();
         timer t1 = wctime();
         MPI_Barrier(MPI_COMM_WORLD);
@@ -689,6 +853,9 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
 
 
         if(rank == 0 && VERB) {
+            // cout << A << endl << endl;
+            cout << *Y << endl << endl;
+            cout << *Q << endl << endl;
             double error = (A - (*Q)*(Q->transpose())*A).norm();
             cout << "Error solve: " << error << endl;
         }

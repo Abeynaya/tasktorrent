@@ -1,6 +1,13 @@
 include Makefile.conf
 
-CFLAGS   += -pthread -O3 -g -std=c++14 -DEIGEN_NO_DEBUG
+
+CFLAGS   += -pthread -O3 -g -std=c++14 
+ifdef DEBUG
+	CFLAGS += -fsanitize=address  -D_GLIBCXX_DEBUG 
+else 
+	CFLAGS += -DEIGEN_NO_DEBUG
+endif
+
 INCLUDE  += -I../../
 LIBS     += 
 SRCDIR   = ../../tasktorrent/src
