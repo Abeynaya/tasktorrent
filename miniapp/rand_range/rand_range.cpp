@@ -26,6 +26,8 @@ using namespace ttor;
 
 typedef array<int, 2> int2;
 typedef array<int, 3> int3;
+typedef array<int, 4> int4;
+
 
 int VERB = 0;
 bool LOG = false;
@@ -37,7 +39,6 @@ int p_ = 1;
 int q_ = 1;
 
 struct denseQR {
-
     /** Usual stuff */
     const int rank;
     const int nranks;
@@ -48,11 +49,14 @@ struct denseQR {
     /** Task flows needed **/
     Taskflow<int> scatter_tf; // from origin to helper ranks
     Taskflow<int> start_qr_tf; // All helper ranks are ready 
-    Taskflow<int> dgeqrt_tf;  // A[k,k] = QR
-    Taskflow<int2> dtsqrt_tf;
-    Taskflow<int2> dlarfb_tf;
-    Taskflow<int3> dssrfb_tf;
-    Taskflow<int2> gather_tf;
+
+    Taskflow<int2> dgeqrt_tf;  // A[k,k] = QR
+    Taskflow<int3> dtsqrt_tf;
+
+    Taskflow<int3> dlarfb_tf;
+    Taskflow<int4> dssrfb_tf;
+
+    Taskflow<int3> gather_tf;
     Taskflow<int> computeQ_tf; // from helper ranks to origin
 
     /** Taskflows obtained from parent function **/
@@ -63,12 +67,12 @@ struct denseQR {
     ActiveMsg<view<double>,view<int>,view<int>, 
               int, int , int, int , int , int , int , int>* am_scatter;
 
-    ActiveMsg<view<double>,view<double>,view<int>,int>* am_dgeqrt_2_dlarfb;
-    ActiveMsg<view<double>,int>* am_dgeqrt_2_dtsqrt;
-    ActiveMsg<view<double>,int, int>* am_dtsqrt_2_dtsqrt;
-    ActiveMsg<view<double>,view<double>,int,view<int>,int>* am_dtsqrt_2_dssrfb;
-    ActiveMsg<view<double>,int, int, int>* am_dlarfb_2_dssrfb;
-    ActiveMsg<view<double>,int, int, int>* am_dssrfb_2_dssrfb;
+    ActiveMsg<view<double>,view<double>,view<int>,int, int>* am_dgeqrt_2_dlarfb;
+    ActiveMsg<view<double>,int, int>* am_dgeqrt_2_dtsqrt;
+    ActiveMsg<view<double>,int, int, int>* am_dtsqrt_2_dtsqrt;
+    ActiveMsg<view<double>,view<double>,int,view<int>,int, int>* am_dtsqrt_2_dssrfb;
+    ActiveMsg<view<double>,int, int, int, int>* am_dlarfb_2_dssrfb;
+    ActiveMsg<view<double>,int, int, int, int>* am_dssrfb_2_dssrfb;
     ActiveMsg<view<double>,view<double>,view<double>,int,int>* am_gather_0;
     ActiveMsg<view<double>,view<double>,int,int>* am_gather_1;
     ActiveMsg<view<double>,int,int>* am_gather_2;
@@ -77,46 +81,59 @@ struct denseQR {
     MatrixXd* A;
     MatrixXd* Tmat;
     MatrixXd* Q;
-    int p; // No. of ranks in x dim
-    int q; // No. of ranks in y dim
-    int n; // block size
-    int M; // no. of blocks in y dim
-    int N; // no. of blocks in x dim
-    int notify_index; // Which notify_tf parent task to notify about completion
-    int origin_rank; // Which rank to gather output on
 
-    /** Workspace **/ // Need to more general ... workspace[origin_rank] = map<int2, MatrixXd> 
-    map<int2, MatrixXd> Mat;
-    map<int2, MatrixXd> T;
+    /** Workspace **/ //workspace[origin] = map<int2, MatrixXd> 
+    vector<map<int2, MatrixXd>> Mat;
+    vector<map<int2, MatrixXd>> T;
+    vector<int> p_; // No. of ranks in x dim
+    vector<int> q_; // No. of ranks in y dim
+    vector<int> n_; // block size
+    vector<int> M_; // no. of blocks in y dim
+    vector<int> N_; // no. of blocks in x dim
+    vector<int> notify_index_; // Which notify_tf parent task to notify about completion
+    // vector<int> origin; // Which rank to gather output on
 
     /* Constructor */
     denseQR(Communicator* comm_, Threadpool* tp_, Taskflow<int>* notify_tf_): rank(comm_->comm_rank()),
     nranks(comm_->comm_size()), n_threads(tp_->size()), comm(comm_), tp(tp_), notify_tf(notify_tf_),
     scatter_tf(tp), start_qr_tf(tp), dgeqrt_tf(tp), dtsqrt_tf(tp), dlarfb_tf(tp), dssrfb_tf(tp), gather_tf(tp), computeQ_tf(tp) {
 
+        Mat.resize(nranks);
+        T.resize(nranks);
+        p_.resize(nranks);
+        q_.resize(nranks);
+        n_.resize(nranks);
+        M_.resize(nranks);
+        N_.resize(nranks);
+        notify_index_.resize(nranks);
+        // origin.reserve(nranks);
+
 
         // Message from helper ranks saying they are ready to begin computation
         am_start_qr = comm->make_active_msg([&] () {
-            start_qr_tf.fulfill_promise(0);
+            // Will be received in the origin
+            start_qr_tf.fulfill_promise(rank);
         });
 
 
         am_scatter = comm->make_active_msg([&](view<double> &V, view<int> &ind_i_, view<int>& ind_j_, int& nblocks,
-                int& p_, int& q_, int& n_, int& M_, int& N_, int& notify_index_, int& origin_rank_){
+                int& p, int& q, int& n, int& M, int& N, int& notify_index, int& origin_rank_){
 
-                p = p_;
-                q = q_;
-                n = n_;
-                M = M_;
-                N = N_;
-                notify_index = notify_index_;
-                origin_rank = origin_rank_;
+                // In the receiving local rank
+                int origin = origin_rank_;
+
+                p_[origin] = p;
+                q_[origin] = q;
+                n_[origin] = n;
+                M_[origin] = M;
+                N_[origin] = N;
+                notify_index_[origin] = notify_index;
 
                 // initialize workspace
                 for (int i=0; i < M; ++i){
                     for (int j=0; j < N; ++j){
-                        Mat[{i,j}] = MatrixXd::Zero(0,0);
-                        if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
+                        Mat[origin][{i,j}] = MatrixXd::Zero(0,0);
+                        if (i>=j) T[origin][{i,j}] = MatrixXd::Zero(0,0);
                     }
                 }
 
@@ -128,58 +145,64 @@ struct denseQR {
                 for (int counter=0; counter < nblocks; ++counter){
                     auto i = ind_i[counter];
                     auto j = ind_j[counter];
-                    Mat[{i,j}] = Vtemp.block(counter*n, 0, n, n);
-                    if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
+                    Mat[origin][{i,j}] = Vtemp.block(counter*n, 0, n, n);
+                    if (i>=j) T[origin][{i,j}] = MatrixXd::Zero(n,n);
                 }
 
                 // Fullfill promise on start_qr_tf
-                start_qr_tf.fulfill_promise(0);
+                start_qr_tf.fulfill_promise(origin);
             }
         );
 
         // From origin to helper ranks
-        scatter_tf.set_mapping([&] (int k){
-            return (k % n_threads);
+        scatter_tf.set_mapping([&] (int origin){ 
+            return (origin % n_threads);
         })
         .set_indegree([](int){
             return 1;
         })
-        .set_task([&] (int k) {
-            assert(rank == origin_rank);
+        .set_task([&] (int origin) {
+            assert(rank == origin); 
+            int M = M_[origin];
+            int N = N_[origin];
+            int n = n_[origin];
+            int p = p_[origin];
+            int q = q_[origin];
+
             // Mapper
             auto block2rank = [&](int2 ij){
                 int i = ij[0];
                 int j = ij[1];
                 int ii = i % p;
                 int jj = j % q;
-                int r = (ii + jj * p + origin_rank) % nranks;
+                int r = (ii + jj * p + origin) % nranks;
                 assert(r <= nranks);
                 return r;
             };
 
             vector<map<int2, MatrixXd>> rank2matrix(nranks);
 
+
             for(int i = 0; i < M; i++) {
                 for (int j=0; j < N; j++){
-                    if (block2rank({i,j}) != origin_rank){
+                    if (block2rank({i,j}) != origin){
                         rank2matrix[block2rank({i,j})][{i,j}] = A->block(i*n, j*n, n, n);
                         // In local workspace
-                        Mat[{i,j}] = MatrixXd::Zero(0,0);
-                        if (i>=j) T[{i,j}] = MatrixXd::Zero(0,0);
+                        Mat[origin][{i,j}] = MatrixXd::Zero(0,0);
+                        if (i>=j) T[origin][{i,j}] = MatrixXd::Zero(0,0);
                     }
                     else {
-                        Mat[{i,j}] = A->block(i*n, j*n, n, n);
-                        if (i>=j) T[{i,j}] = MatrixXd::Zero(n,n);
+                        Mat[origin][{i,j}] = A->block(i*n, j*n, n, n);
+                        if (i>=j) T[origin][{i,j}] = MatrixXd::Zero(n,n);
 
                     }
                 }
             }
-
-            start_qr_tf.fulfill_promise(0); // local 
+            start_qr_tf.fulfill_promise(origin); // local 
 
             // Send blocks to other ranks 
             for (int i=0; i < nranks; ++i){
-                if (i != origin_rank){
+                if (i != origin){
                     int msize = rank2matrix[i].size();
                     MatrixXd submatrix = MatrixXd::Zero(msize*n, n); // Each block is of size n by n
                     vector<int> ind_i(msize);
@@ -195,34 +218,36 @@ struct denseQR {
                     auto ind_i_view = view<int>(ind_i.data(), msize);
                     auto ind_j_view = view<int>(ind_j.data(), msize);
 
-                    am_scatter->send(i, submatrix_view, ind_i_view, ind_j_view,  msize, p, q, n, M, N, notify_index, origin_rank);
+                    am_scatter->send(i, submatrix_view, ind_i_view, ind_j_view,  msize, 
+                                    p, q, n, M, N,
+                                    notify_index_[origin], origin);
                 }
             }
 
         })
-        .set_name([](int k) {
-            return "scatter_" + to_string(k);
+        .set_name([](int origin) {
+            return "scatter_" + to_string(origin);
         })
         .set_priority([&](int) {
             return 6;
         });
 
-        start_qr_tf.set_mapping([&] (int k){
-            return k % n_threads;
+        start_qr_tf.set_mapping([&] (int origin){
+            return origin % n_threads;
         })
         .
-        set_indegree([&] (int) {
-            if (rank == origin_rank) return nranks;
+        set_indegree([&] (int origin) {
+            if (rank == origin) return nranks;
             else return 1;
         })
-        .set_task([&] (int k) {
+        .set_task([&] (int origin) {
             cout << " Rank " << rank << " ready to begin QR" << endl;
-            if (rank == origin_rank){
-                dgeqrt_tf.fulfill_promise(0);
+            if (rank == origin){
+                dgeqrt_tf.fulfill_promise({origin,0});
             }
             else {
                 // Send a message to origin rank
-                am_start_qr->send(origin_rank);
+                am_start_qr->send(origin);
             }
         })
         .set_name([](int k) {
@@ -235,75 +260,94 @@ struct denseQR {
 
         // From dgeqrt
         am_dgeqrt_2_dlarfb = comm->make_active_msg(
-            [&](view<double> &V, view<double> &tau, view<int>& js, int& k){
-                Mat.at({k,k}) = Map<MatrixXd>(V.data(), n, n); // Check strides
-                T.at({k,k})   = Map<MatrixXd>(tau.data(), n, n);
+            [&](view<double> &V, view<double> &tau, view<int>& js, int& k, int& origin){
+                int n = n_[origin];
+                Mat[origin].at({k,k}) = Map<MatrixXd>(V.data(), n, n); // Check strides
+                T[origin].at({k,k})   = Map<MatrixXd>(tau.data(), n, n);
                 for (auto& j: js){
-                    dlarfb_tf.fulfill_promise({k,j});
+                        cout << "j" << endl;
+
+                    dlarfb_tf.fulfill_promise({origin,k,j});
                 }
             }
         );
 
         am_dgeqrt_2_dtsqrt = comm->make_active_msg(
-            [&](view<double> &R, int& k){
-                Mat.at({k,k}) = Map<MatrixXd>(R.data(), n, n); // Check strides
-                dtsqrt_tf.fulfill_promise({k+1,k});
+            [&](view<double> &R, int& k, int& origin){
+                int n = n_[origin];
+                Mat[origin].at({k,k}) = Map<MatrixXd>(R.data(), n, n); // Check strides
+                dtsqrt_tf.fulfill_promise({origin, k+1,k});
             }
         );
 
         // From dsqrt
         am_dtsqrt_2_dtsqrt = comm->make_active_msg(
-            [&](view<double> &R, int& i, int& k){
-                Mat.at({k,k}) = Map<MatrixXd>(R.data(), n, n); // Check strides
-                dtsqrt_tf.fulfill_promise({i,k});
+            [&](view<double> &R, int& i, int& k, int& origin){
+                int n = n_[origin];
+                Mat[origin].at({k,k}) = Map<MatrixXd>(R.data(), n, n); // Check strides
+                dtsqrt_tf.fulfill_promise({origin,i,k});
             }
         );
 
         am_dtsqrt_2_dssrfb = comm->make_active_msg(
-            [&](view<double> &V_ik, view<double> &T_ik, int& i, view<int>& js, int& k){
-                Mat.at({i,k}) = Map<MatrixXd>(V_ik.data(), n, n); 
-                T.at({i,k}) = Map<MatrixXd>(T_ik.data(), n, n); 
+            [&](view<double> &V_ik, view<double> &T_ik, int& i, view<int>& js, int& k, int& origin){
+                int n = n_[origin];
+                Mat[origin].at({i,k}) = Map<MatrixXd>(V_ik.data(), n, n); 
+                T[origin].at({i,k}) = Map<MatrixXd>(T_ik.data(), n, n); 
 
                 for(auto& j: js){
-                    dssrfb_tf.fulfill_promise({i,j,k}); 
+                    dssrfb_tf.fulfill_promise({origin,i,j,k}); 
                 }
             }
         );
 
         // From dlarfb
         am_dlarfb_2_dssrfb = comm->make_active_msg(
-            [&](view<double> &R, int& i, int&j,  int& k){
-                Mat.at({k,j}) = Map<MatrixXd>(R.data(), n, n); // Check strides
-                dssrfb_tf.fulfill_promise({i,j,k});
+            [&](view<double> &R, int& i, int&j,  int& k, int& origin){
+                int n = n_[origin];
+                Mat[origin].at({k,j}) = Map<MatrixXd>(R.data(), n, n); // Check strides
+                dssrfb_tf.fulfill_promise({origin, i,j,k});
             }
         );
 
         // From dssrfb
         am_dssrfb_2_dssrfb = comm->make_active_msg(
-            [&](view<double> &R, int& i, int&j,  int& k){
-                Mat.at({k,j}) = Map<MatrixXd>(R.data(), n, n); // Check strides
-                dssrfb_tf.fulfill_promise({i,j,k});
+            [&](view<double> &R, int& i, int&j,  int& k, int& origin){
+                int n = n_[origin];
+                Mat[origin].at({k,j}) = Map<MatrixXd>(R.data(), n, n); // Check strides
+                dssrfb_tf.fulfill_promise({origin, i,j,k});
             }
         );
 
         // Define taskflows
-        dgeqrt_tf.set_mapping([&] (int k){
+        dgeqrt_tf.set_mapping([&] (int2 ok){
+                int k = ok[1];
                 return (k % n_threads);
             })
-            .set_indegree([](int){
+            .set_indegree([](int2){
                 return 1;
             })
-            .set_task([&] (int k) {
-                int info = LAPACKE_dgeqrt(LAPACK_COL_MAJOR, n, n, n, Mat.at({k,k}).data(), n, T.at({k,k}).data(), n);
+            .set_task([&] (int2 ok) {
+                int origin = ok[0];
+                int k = ok[1];
+                int n = n_[origin];
+                int info = LAPACKE_dgeqrt(LAPACK_COL_MAJOR, n, n, n, Mat[origin].at({k,k}).data(), n, T[origin].at({k,k}).data(), n);
                 assert(info == 0);
             })
-            .set_fulfill([&](int k) {
+            .set_fulfill([&](int2 ok) {
                 // Dependencies -- dlarfb 
+                int origin = ok[0];
+                int k = ok[1];
+                int M = M_[origin];
+                int N = N_[origin];
+                int n = n_[origin];
+                int p = p_[origin];
+                int q = q_[origin];
 
                 map<int, vector<int>> to_fulfill;
 
                 for(int j = k+1; j<N; j++) { // A[k][j] blocks
-                    int r = ((k%p)+ (j%q)*p + origin_rank) % nranks;
+                    int r = ((k%p)+ (j%q)*p + origin) % nranks;
                     if(to_fulfill.count(r) == 0) {
                         to_fulfill[r] = {j};
                     } else {
@@ -314,19 +358,19 @@ struct denseQR {
 
                 // First dtsqrt
                 if (k+1 < M){
-                   int r = ((k+1)%p + (k%q)*p + origin_rank) % nranks;;
+                   int r = ((k+1)%p + (k%q)*p + origin) % nranks;;
                    if (r == rank){
-                       dtsqrt_tf.fulfill_promise({k+1, k});
+                       dtsqrt_tf.fulfill_promise({origin, k+1, k});
                    }
                    else {
-                       auto R_kk = view<double>(Mat.at({k,k}).data(), n * n );
-                       am_dgeqrt_2_dtsqrt->send(r, R_kk, k);
+                       auto R_kk = view<double>(Mat[origin].at({k,k}).data(), n * n );
+                       am_dgeqrt_2_dtsqrt->send(r, R_kk, k, origin);
 
                    } 
                 }
                 
-                // gather on node origin_rank
-                gather_tf.fulfill_promise({k,k});
+                // gather on node origin
+                gather_tf.fulfill_promise({origin, k,k});
 
 
                 // Send data and trigger tasks -- dlarfb
@@ -334,41 +378,53 @@ struct denseQR {
                     int r = p.first; // rank
                     if (r == rank){
                         for(auto& j: p.second){
-                            dlarfb_tf.fulfill_promise({k, j}); 
+                            dlarfb_tf.fulfill_promise({origin, k, j}); 
                         }
                     }
                     else {
-                        auto V_kk = view<double>(Mat.at({k,k}).data(), n * n );
-                        auto T_kk = view<double>(T.at({k,k}).data(), n*n);
+                        auto V_kk = view<double>(Mat[origin].at({k,k}).data(), n * n );
+                        auto T_kk = view<double>(T[origin].at({k,k}).data(), n*n);
                         auto jsv = view<int>(p.second.data(), p.second.size());
-                        am_dgeqrt_2_dlarfb->send(r, V_kk, T_kk, jsv, k);
+                        am_dgeqrt_2_dlarfb->send(r, V_kk, T_kk, jsv, k, origin);
                     }
                 }
 
             })
-            .set_name([](int j) {
-                return "geqrt_" + to_string(j);
+            .set_name([](int2 ij) {
+                return "geqrt_" + to_string(ij[0]) + to_string(ij[1]);
             })
-            .set_priority([&](int) {
+            .set_priority([&](int2) {
                 return 4;
             });
 
-        dtsqrt_tf.set_mapping([&] (int2 ik){
-                return ((ik[0] + ik[1] * N) % n_threads);
+        dtsqrt_tf.set_mapping([&] (int3 oik){
+                int origin = oik[0];
+                int N = N_[origin];
+                return ((oik[1] + oik[2] * N) % n_threads);
             })
-            .set_indegree([](int2 ik){
-                return (ik[1] == 0 ? 0 : 1) + 1;
+            .set_indegree([](int3 oik){
+                return (oik[2] == 0 ? 0 : 1) + 1;
             })
-            .set_task([&] (int2 ik) {
-                int i = ik[0];
-                int k = ik[1];
+            .set_task([&] (int3 oik) {
+                int origin = oik[0];
+                int i = oik[1];
+                int k = oik[2];
+                int n = n_[origin];
 
-                int info = LAPACKE_dtpqrt(LAPACK_COL_MAJOR, n, n, 0, n, Mat.at({k,k}).data(), n, Mat.at({i,k}).data(), n, T.at({i,k}).data(), n);
+                int info = LAPACKE_dtpqrt(LAPACK_COL_MAJOR, n, n, 0, n, Mat[origin].at({k,k}).data(), n, 
+                                          Mat[origin].at({i,k}).data(), n, T[origin].at({i,k}).data(), n);
                 assert(info == 0);
             })
-            .set_fulfill([&](int2 ik) {
-                int i = ik[0];
-                int k = ik[1];
+            .set_fulfill([&](int3 oik) {
+                int origin = oik[0];
+                int i = oik[1];
+                int k = oik[2];
+
+                int M = M_[origin];
+                int N = N_[origin];
+                int n = n_[origin];
+                int p = p_[origin];
+                int q = q_[origin];
 
                 // Dependencies 
                 map<int, vector<int>> to_fulfill;
@@ -376,25 +432,25 @@ struct denseQR {
                 // Next dtsqrt
                 if (i+1 < M){
                     // int r = block2rank({i+1,k});
-                    int r = ((i+1)%p+ (k%q)*p + origin_rank) % nranks;
+                    int r = ((i+1)%p+ (k%q)*p + origin) % nranks;
                     if (r == rank){
-                        dtsqrt_tf.fulfill_promise({i+1, k});
+                        dtsqrt_tf.fulfill_promise({origin, i+1, k});
                     }
                     else {
-                        auto R_kk = view<double>(Mat.at({k,k}).data(), n * n );
+                        auto R_kk = view<double>(Mat[origin].at({k,k}).data(), n * n );
                         int inext = i+1;
-                        am_dtsqrt_2_dtsqrt->send(r, R_kk, inext, k) ; // send A{k,k}
+                        am_dtsqrt_2_dtsqrt->send(r, R_kk, inext, k, origin) ; // send A{k,k}
                     }
                 }
 
                 // gather on node 0
-                gather_tf.fulfill_promise({i,k}); 
+                gather_tf.fulfill_promise({origin, i,k}); 
                 
 
                 // dssrfb
                 for(int j = k+1; j<N; j++) { 
                     // int r = block2rank({i,j}); // ssrfb
-                    int r = ((i%p)+ (j%q)*p + origin_rank) % nranks;
+                    int r = ((i%p)+ (j%q)*p + origin) % nranks;
                     if(to_fulfill.count(r) == 0) {
                         to_fulfill[r] = {j};
                     } else {
@@ -407,107 +463,128 @@ struct denseQR {
                     int r = p.first; // rank
                     if (r == rank){
                         for(auto& j: p.second){
-                            dssrfb_tf.fulfill_promise({i,j,k}); 
+                            dssrfb_tf.fulfill_promise({origin, i,j,k}); 
                         }
                     }
                     else {
-                        auto V_ik = view<double>(Mat.at({i,k}).data(), n * n );
-                        auto T_ik = view<double>(T.at({i,k}).data(), n*n);
+                        auto V_ik = view<double>(Mat[origin].at({i,k}).data(), n * n );
+                        auto T_ik = view<double>(T[origin].at({i,k}).data(), n*n);
                         auto jsv = view<int>(p.second.data(), p.second.size());
 
-                        am_dtsqrt_2_dssrfb->send(r, V_ik, T_ik, i, jsv, k);
+                        am_dtsqrt_2_dssrfb->send(r, V_ik, T_ik, i, jsv, k, origin);
                     }
                 }
 
             })
-            .set_name([](int2 ik) {
-                return "tsqrt_" + to_string(ik[0]) + "_" +to_string(ik[1]);
+            .set_name([](int3 oik) {
+                return "tsqrt_" + to_string(oik[0]) + "_" +to_string(oik[1]) + "_" +to_string(oik[2]);
             })
-            .set_priority([&](int2) {
+            .set_priority([&](int3) {
                 return 3;
             });
 
         // larfb
-        dlarfb_tf.set_mapping([&] (int2 kj){
-                return ((kj[0] + kj[1]*N) % n_threads);
+        dlarfb_tf.set_mapping([&] (int3 okj){
+                int origin = okj[0];
+                int N = N_[origin];
+                return ((okj[1] + okj[2]*N) % n_threads);
             })
-            .set_indegree([](int2 kj){
-                return (kj[0] == 0 ? 0 : 1) + 1;
+            .set_indegree([](int3 okj){
+                return (okj[1] == 0 ? 0 : 1) + 1;
             })
-            .set_task([&] (int2 kj) {
+            .set_task([&] (int3 okj) {
+                int origin = okj[0];
+                int k=okj[1]; // who is sending
+                int j=okj[2]; // me
+                int n=n_[origin];
 
-                int k=kj[0]; // who is sending
-                int j=kj[1]; // me
-
-                int info = LAPACKE_dlarfb(LAPACK_COL_MAJOR, 'L', 'T', 'F', 'C', n, n, n, Mat.at({k,k}).data(), n, T.at({k,k}).data(), n, Mat.at({k,j}).data(), n);
+                int info = LAPACKE_dlarfb(LAPACK_COL_MAJOR, 'L', 'T', 'F', 'C', n, n, n,
+                                           Mat[origin].at({k,k}).data(), n, T[origin].at({k,k}).data(), 
+                                        n, Mat[origin].at({k,j}).data(), n);
                 assert(info == 0);
 
             })
-            .set_fulfill([&](int2 kj) {
-                int k = kj[0];
-                int j = kj[1];
+            .set_fulfill([&](int3 okj) {
+                int origin = okj[0];
+                int k = okj[1];
+                int j = okj[2];
+
+                int M = M_[origin];
+                int N = N_[origin];
+                int n = n_[origin];
+                int p = p_[origin];
+                int q = q_[origin];
                 
                 if (k+1 < M){
                     // int r = block2rank({k+1, j});
-                    int r = ((k+1)%p+ (j%q)*p + origin_rank) % nranks;
+                    int r = ((k+1)%p+ (j%q)*p + origin) % nranks;
                     if (r == rank){
-                        dssrfb_tf.fulfill_promise({k+1, j, k});
+                        dssrfb_tf.fulfill_promise({origin, k+1, j, k});
                     }
                     else {
-                        auto R_kj = view<double>(Mat.at({k,j}).data(), n * n ); 
+                        auto R_kj = view<double>(Mat[origin].at({k,j}).data(), n * n ); 
                         int knext = k+1;
-                        am_dlarfb_2_dssrfb->send(r, R_kj, knext, j, k); //send R_kj
+                        am_dlarfb_2_dssrfb->send(r, R_kj, knext, j, k, origin); //send R_kj
                     }
                 }
                 
                 
             })
-            .set_name([](int2 kj) {
-                return "dlarfb_" + to_string(kj[0]) + "_" +to_string(kj[1]);
+            .set_name([](int3 okj) {
+                return "dlarfb_" + to_string(okj[0]) + "_" +to_string(okj[1]) + "_" +to_string(okj[2]);
             })
-            .set_priority([&](int2) {
+            .set_priority([&](int3) {
                 return 2;
             });
 
-        dssrfb_tf.set_mapping([&] (int3 ijk){
-                return ((ijk[0] + ijk[1] * N + ijk[2] * N * N) % n_threads);
+        dssrfb_tf.set_mapping([&] (int4 oijk){
+                int origin = oijk[0];
+                int N = N_[origin];
+                return ((oijk[1] + oijk[2] * N + oijk[3] * N * N) % n_threads);
             })
-            .set_indegree([](int3 ijk){
-                int i = ijk[0];
-                int j = ijk[1];
-                int k = ijk[2];
-
+            .set_indegree([](int4 oijk){
+                int k = oijk[3];
                 return (k==0 ? 2 : 3);
-
             })
-            .set_task([&] (int3 ijk) {
-                int i = ijk[0];
-                int j = ijk[1];
-                int k = ijk[2];
+            .set_task([&] (int4 oijk) {
+                int origin = oijk[0];
+                int i = oijk[1];
+                int j = oijk[2];
+                int k = oijk[3];
+                int n = n_[origin];
+
                 
                 int info = LAPACKE_dtpmqrt(LAPACK_COL_MAJOR, 'L', 'T', n, n, n, 0, n, 
-                                           Mat.at({i,k}).data(), n,
-                                           T.at({i,k}).data(), n,
-                                           Mat.at({k,j}).data(), n,
-                                           Mat.at({i,j}).data(), n);
+                                           Mat[origin].at({i,k}).data(), n,
+                                           T[origin].at({i,k}).data(), n,
+                                           Mat[origin].at({k,j}).data(), n,
+                                           Mat[origin].at({i,j}).data(), n);
                 assert(info == 0);
 
             })
-            .set_fulfill([&](int3 ijk) {
-                int i = ijk[0];
-                int j = ijk[1];
-                int k = ijk[2];
+            .set_fulfill([&](int4 oijk) {
+                int origin = oijk[0];
+                int i = oijk[1];
+                int j = oijk[2];
+                int k = oijk[3];
+
+
+                int M = M_[origin];
+                int N = N_[origin];
+                int n = n_[origin];
+                int p = p_[origin];
+                int q = q_[origin];
 
                 if (i+1 < M){
                     // int r = block2rank({i+1,j});
-                    int r = ((i+1)%p+ (j%q)*p + origin_rank) % nranks;
+                    int r = ((i+1)%p+ (j%q)*p + origin) % nranks;
                     if (r == rank){
-                        dssrfb_tf.fulfill_promise({i+1,j,k});
+                        dssrfb_tf.fulfill_promise({origin, i+1,j,k});
                     }
                     else {
-                        auto R_kj = view<double>(Mat.at({k,j}).data(), n * n ); 
+                        auto R_kj = view<double>(Mat[origin].at({k,j}).data(), n * n ); 
                         int inext = i+1;
-                        am_dssrfb_2_dssrfb->send(r, R_kj, inext, j, k);  
+                        am_dssrfb_2_dssrfb->send(r, R_kj, inext, j, k, origin);  
                     }
                 }
                 
@@ -515,132 +592,139 @@ struct denseQR {
                 if (i == k+1) {
                     if (j == k+1){
                         // same rank
-                        dgeqrt_tf.fulfill_promise(i); // i = k+1
+                        dgeqrt_tf.fulfill_promise({origin, i}); // i = k+1
                     }
                     else { // j > k+1
                         assert(j > k+1);
-                        dlarfb_tf.fulfill_promise({i, j}); // i = k+1
+                        dlarfb_tf.fulfill_promise({origin, i, j}); // i = k+1
                     }
                 }
                 else { // i > k+1
                     assert(i > k+1);
                     if (j == k+1) {
-                        dtsqrt_tf.fulfill_promise({i, j}); // j = k+1
+                        dtsqrt_tf.fulfill_promise({origin, i, j}); // j = k+1
                     }
                     else {
                         assert(j > k+1);
-                        dssrfb_tf.fulfill_promise({i, j, k+1}); 
+                        dssrfb_tf.fulfill_promise({origin, i, j, k+1}); 
                     }
                 }
                 
             })
-            .set_name([](int3 ijk) {
-                return "dssrfb_" + to_string(ijk[0]) + "_" +to_string(ijk[1]) + "_" + to_string(ijk[2]);
+            .set_name([](int4 oijk) {
+                return "dssrfb_" + to_string(oijk[0]) + "_" +to_string(oijk[1]) + "_" + to_string(oijk[2]) + "_" + to_string(oijk[3]);
             })
-            .set_priority([&](int3) {
+            .set_priority([&](int4) {
                 return 1;
             });  
 
         am_gather_0 = comm->make_active_msg(
         [&](view<double> &R_j, view<double> &V_ij, view<double> &T_ij,  int& i, int& j) {
+            int n = n_[rank];
+
             A->block(0, j*n, (j+1)*n, n) = Map<MatrixXd>(R_j.data(), (j+1)*n, n) ;
-            // MatrixXd Rtemp = Map<MatrixXd>(R_j.data(), (j+1)*n, n) ;
-            // for (int k=0; k<j+1; ++k){
-            //     Mat.at({k,j}) = Rtemp.block(k*n, 0, n, n);
-            // }
             A->block(i*n, j*n, n, n) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
             Tmat->block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
-            // Mat.at({i,j}) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
-            // T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
-            computeQ_tf.fulfill_promise(0);
+
+            computeQ_tf.fulfill_promise(rank);
         });
 
         am_gather_1 = comm->make_active_msg(
         [&](view<double> &V_ij, view<double> &T_ij,  int& i, int& j) {
+            int n = n_[rank];
+
             A->block(i*n, j*n, n, n) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
             Tmat->block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
 
-            // Mat.at({i,j}) = Map<MatrixXd>(V_ij.data(), n, n); // Last block
-            // T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
-            computeQ_tf.fulfill_promise(0);
+            computeQ_tf.fulfill_promise(rank);
 
 
         });
 
         am_gather_2 = comm->make_active_msg(
         [&](view<double> &T_ij,  int& i, int& j) {
+            int n = n_[rank];
+
             Tmat->block(i*n, j*n, n, n) = Map<MatrixXd>(T_ij.data(), n, n);
-            // T.at({i,j}) = Map<MatrixXd>(T_ij.data(), n, n);
-            computeQ_tf.fulfill_promise(0);
+            computeQ_tf.fulfill_promise(rank);
 
 
         });
 
         // gather
-        gather_tf.set_mapping([&](int2 ij) {
-                return ( (ij[0] + ij[1]*N) % n_threads );
+        gather_tf.set_mapping([&](int3 oij) {
+                int origin = oij[0];
+                int N = N_[origin];
+                return ( (oij[1] + oij[2]*N) % n_threads );
             })
-            .set_indegree([](int2) {
+            .set_indegree([](int3) {
                 return 1;
             })
-            .set_task([&](int2 ij) {
-                int i = ij[0];
-                int j = ij[1];
+            .set_task([&](int3 oij) {
+                int origin = oij[0];
+                int i = oij[1];
+                int j = oij[2];
+                int n = n_[origin];
+                int M = M_[origin];
 
-                if(rank != origin_rank) {
+                if(rank != origin) {
                     if (i == M-1) { // Last row contains all the updated R[:, j]
                         MatrixXd Atemp = MatrixXd::Zero( (j+1)*n, n);
                         for (int k=0; k< j+1; ++k){ 
-                            Atemp.block(k*n, 0, n, n) = Mat.at({k,j}); // R[:,j] of A = QR
+                            Atemp.block(k*n, 0, n, n) = Mat[origin].at({k,j}); // R[:,j] of A = QR
                         }
                         auto R_j = view<double>(Atemp.data(), (j+1)*n*n);
 
-                        auto V_ij = view<double>(Mat.at({i,j}).data(), n*n);
-                        auto T_ij = view<double>(T.at({i,j}).data(), n*n);
-                        am_gather_0->send(origin_rank, R_j, V_ij, T_ij, i, j);
+                        auto V_ij = view<double>(Mat[origin].at({i,j}).data(), n*n);
+                        auto T_ij = view<double>(T[origin].at({i,j}).data(), n*n);
+                        am_gather_0->send(origin, R_j, V_ij, T_ij, i, j);
                     }
                     else if (i > j){ // Just send the V_ij, T_ij
-                        auto V_ij = view<double>(Mat.at({i,j}).data(), n*n);
-                        auto T_ij = view<double>(T.at({i,j}).data(), n*n);
-                        am_gather_1->send(origin_rank, V_ij, T_ij, i, j);
+                        auto V_ij = view<double>(Mat[origin].at({i,j}).data(), n*n);
+                        auto T_ij = view<double>(T[origin].at({i,j}).data(), n*n);
+                        am_gather_1->send(origin, V_ij, T_ij, i, j);
                     }
                     else {
                         assert(i == j);
-                        auto T_ij = view<double>(T.at({i,j}).data(), n*n);
-                        am_gather_2->send(origin_rank, T_ij, i, j);
+                        auto T_ij = view<double>(T[origin].at({i,j}).data(), n*n);
+                        am_gather_2->send(origin, T_ij, i, j);
                     }
                 } 
                 else {
                     if (i == M-1){
                         for (int k=0; k< j+1; ++k){ 
-                            A->block(k*n, j*n, n, n) = Mat.at({k,j}); // R[:,j] of A = QR
+                            A->block(k*n, j*n, n, n) = Mat[origin].at({k,j}); // R[:,j] of A = QR
                         }
-                        A->block(i*n, j*n, n, n) = Mat.at({i, j}); // Last block
-                        Tmat->block(i*n, j*n, n, n) = T.at({i,j});
-                        computeQ_tf.fulfill_promise(0);
+                        A->block(i*n, j*n, n, n) = Mat[origin].at({i, j}); // Last block
+                        Tmat->block(i*n, j*n, n, n) = T[origin].at({i,j});
+                        computeQ_tf.fulfill_promise(origin);
                     }
                     else if (i > j){
-                        A->block(i*n, j*n, n, n) = Mat.at({i,j}); // just that block; contains V
-                        Tmat->block(i*n, j*n, n, n) = T.at({i,j});
-                        computeQ_tf.fulfill_promise(0);
+                        A->block(i*n, j*n, n, n) = Mat[origin].at({i,j}); // just that block; contains V
+                        Tmat->block(i*n, j*n, n, n) = T[origin].at({i,j});
+                        computeQ_tf.fulfill_promise(origin);
 
                     }
                     else {
                         assert(i == j);
                         // Send T
-                        Tmat->block(i*n, j*n, n, n) = T.at({i,j});
-                        computeQ_tf.fulfill_promise(0);
+                        Tmat->block(i*n, j*n, n, n) = T[origin].at({i,j});
+                        computeQ_tf.fulfill_promise(origin);
 
                     }
                 }
             })
-            .set_name([](int2 ij) {
-                return "gather_"+ to_string(ij[0]) + "_" +to_string(ij[1]);
+            .set_name([](int3 oij) {
+                return "gather_"+ to_string(oij[0]) + "_" +to_string(oij[1]) + "_" +to_string(oij[2]);
             });
 
 
             computeQ_tf.set_task([&] (int k){
                 cout << "Computing_Q" << endl;
+                int n = n_[rank]; // happens only on origin
+                int M = M_[rank];
+                int N = N_[rank];
+
                 for (int j = N-1; j > -1; --j){
 
                     for (int k=0; k<N; ++k){
@@ -678,6 +762,8 @@ struct denseQR {
                 }
             })
             .set_indegree([&] (int k){
+                int M = M_[rank];
+                int N = N_[rank];
                 return (M* (M +1)/2 - (M-N)*(M-N+1)/2);
             })
             .set_mapping([&] (int k){
@@ -687,35 +773,29 @@ struct denseQR {
                 return "computeQ_tf_" + to_string(k);
             })
             .set_fulfill([&](int k){
-                notify_tf->fulfill_promise(notify_index);
+                notify_tf->fulfill_promise(notify_index_[rank]);
             });           
     }
 
     /** Function **/
     void run(MatrixXd* Y_, MatrixXd* Tmat_, MatrixXd* Q_, int block_size, int k){
+        this->A = Y_; // A to be performed QR on  -- only origin will have a copy of this
+        this->Tmat = Tmat_;  //-- only origin will have a copy of this
+        this->Q = Q_; // thin Q -- only origin will have a copy of this
 
-        this->A = Y_; // A to be performed QR on 
-        this->Tmat = Tmat_;  
-        this->Q = Q_; // thin Q
+        int origin = comm_rank();
 
-        origin_rank = comm_rank();
+        p_[origin] = pow(2,ceil(log(nranks)/log(2)));
+        q_[origin] = floor(nranks/p_[origin]);
 
-        p = pow(2,ceil(log(nranks)/log(2)));
-        q = floor(nranks/p);
+        notify_index_[origin] = k;
 
-        notify_index = k;
+        M_[origin] = ceil(Y_->rows()/block_size);
+        N_[origin] = ceil(Y_->cols()/block_size);
 
-        M = ceil(Y_->rows()/block_size);
-        N = ceil(Y_->cols()/block_size);
+        n_[origin] = block_size;
 
-        n = block_size;
-
-        
-        scatter_tf.fulfill_promise(0);
-        // if (rank == 0){
-        // dgeqrt_tf.fulfill_promise(0);
-        // }
-
+        scatter_tf.fulfill_promise(origin);
     }
 
 };
@@ -738,7 +818,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
     VectorXd x ;
     VectorXd b ;
     VectorXd bref ;
-    int samp=10; // Oversampling parameter
+    int samp=0; // Oversampling parameter
     
     MatrixXd A;
     MatrixXd* Y = new MatrixXd(M*n, N*n);
@@ -748,7 +828,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
     MatrixXd* Tmat = new MatrixXd(M*n, N*n); 
     Tmat->setZero();
 
-    int origin = 1;
+    int origin = 0;
     // Factorize
     // {
         // Initialize the communicator structure
@@ -761,7 +841,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
         denseQR qr(&comm, &tp, &notify_tf); // Every rank does this. 
 
         notify_tf.set_task([&] (int k){
-            printf("Randomized range finder is done and gathered on node 0\n");
+            printf("Randomized range finder is done and gathered on rank %d\n",rank);
         })
         .set_indegree([&] (int k){
             return 1;
@@ -782,7 +862,7 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
         })
         .set_task([&] (int k){
             printf("Modelling the sparsify task; call the RRQR function\n");
-            std::default_random_engine default_gen = default_random_engine(2020);
+            std::default_random_engine default_gen = default_random_engine(2020+20*k);
             auto gen_gaussian = [&](int i, int j){ return get_gaussian(i, j, &default_gen); };
 
 
@@ -805,26 +885,30 @@ int rand_range(int n_threads, int n, int M, int N, int p, int q)
             
             // Multiply Y with G
             *Y = A*G; 
+            // cout << *Y << endl << endl;
 
-            qr.run(Y, Tmat, Q, n, 0);
+            qr.run(Y, Tmat, Q, n, k);
         });
 
         timer t0 = wctime();
-        if (rank == origin){
-            sparsify_tf.fulfill_promise(0);
-        }
+        // if (rank == origin){
+            sparsify_tf.fulfill_promise(rank);
+        // }
         tp.join();
         timer t1 = wctime();
         MPI_Barrier(MPI_COMM_WORLD);
-        if(rank == origin)
-        {
-            cout << "Time : " << elapsed(t0, t1) << endl;
-        }
+        // if(rank == origin)
+        // {
+            cout << "rank: " << rank << " Time : " << elapsed(t0, t1) << endl;
+        // }
 
 
-        if(rank == origin && VERB) {
+        if(VERB) {
+            // cout << *Y << endl << endl;
+            // cout << *Q << endl << endl;
+
             double error = (A - (*Q)*(Q->transpose())*A).norm();
-            cout << "Error solve: " << error << endl;
+            cout << "rank: " << rank << " Error solve: " << error << endl;
         }
 
        delete Q;
